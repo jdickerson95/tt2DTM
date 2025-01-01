@@ -120,5 +120,5 @@ def get_rotation_matrices(
             ).float()
         )
 
-    rotation_matrices = torch.stack(rotation_matrices, dim=0)
+    rotation_matrices = torch.stack(rotation_matrices, dim=0).squeeze(0)
     return rotation_matrices

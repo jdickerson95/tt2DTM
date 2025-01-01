@@ -17,7 +17,7 @@ from tt2dtm.utils.calculate_filters import (
     get_defocus_values,
 )
 from tt2dtm.utils.fourier_slice import _sinc2, extract_fourier_slice, fft_volume
-from tt2dtm.utils.image_operations import pad_volume
+from tt2dtm.utils.image_operations import pad_to_shape_2d, pad_volume, edge_mean_reduction_2d
 from tt2dtm.utils.io_handler import (
     load_mrc_map,
     load_mrc_micrographs,
@@ -79,7 +79,7 @@ def run_tm(input_yaml: str):
         template_shape=mrc_map.shape,
     )
     combined_template_filter = combine_filters(whiten_template, bandpass_template)
-
+    print("combined template filter shape", combined_template_filter.shape)
     ####MICROGRAPH OPERATIONS####
     # Apply the filter to the micrographs and phase random if wanted
     dft_micrographs_filtered = dft_micrographs * combined_micrograph_filter
@@ -98,6 +98,7 @@ def run_tm(input_yaml: str):
     dft_micrographs_filtered /= torch.sqrt(
         torch.sum(torch.abs(dft_micrographs_filtered) ** 2, dim=(-2, -1), keepdim=True)
     )
+    print("dft micrographs filtered shape", dft_micrographs_filtered.shape)
 
     ####TEMPLATE STUFF####
     # Calculate range of Cs values of pixel size search
@@ -155,6 +156,7 @@ def run_tm(input_yaml: str):
         volume_shape=mrc_map.shape,
     )  # shape (n_angles, h, w)
     print("done projections")
+    print("projections shape", projections.shape)
     # Calculate CTFs and multiply them with the filters
     defocus_values = (defoc_u_vals + defoc_v_vals) / 2
     astigmatism_values = (defoc_u_vals - defoc_v_vals) / 2
@@ -179,20 +181,65 @@ def run_tm(input_yaml: str):
         fftshift=False,
     )  # shape needs to be (n_micrographs, n_Cs, n_defoc, h, w)
     print("ctf shape", ctf_2d.shape)
+    # if ctf only four dimensions, rearrange to 5 (add Cs dimension)
+    if ctf_2d.ndim == 4:
+        ctf_2d = einops.rearrange(ctf_2d, "nMic nDefoc h w -> nMic nDefoc 1 h w")
+    print("ctf shape", ctf_2d.shape)
+    # multiply ctf by filters
+    combined_template_filter = einops.rearrange(
+        combined_template_filter, "nMic h w -> nMic 1 1 h w"
+    )
+    combined_template_filter = combined_template_filter * ctf_2d
+    print("combined template filter shape", combined_template_filter.shape)
 
-    # all_ctf = einops.rearrange(all_ctf, 'nCs nMic nDefoc h w -> nMic nCs nDefoc h w')
-    # print('all ctf shape', all_ctf.shape)
-    print("test")
+
     # Apply the combined filters to projections
-    # Backwards FFT. Subtract mean of edge (mean 0)
+    #the final shape will now be (n_micrographs, n_defoc, n_Cs, n_angles, h, w)
+    projections = einops.rearrange(projections, "nAng h w -> 1 1 1 nAng h w")
+    combined_template_filter = einops.rearrange(
+        combined_template_filter, "nMic nDefoc nCs h w -> nMic nDefoc nCs 1 h w"
+    )
+    projections = projections * combined_template_filter
+    print("projections shape", projections.shape)
+    print("projections filtered")
+    # Backwards FFT
+    projections = torch.fft.irfftn(projections, dim=(-2, -1))
+    #flip contrast
+    projections = projections * -1
+    #. Subtract mean of edge (mean 0)
+    mean_edge = edge_mean_reduction_2d(projections)
+    mean_edge = einops.rearrange(mean_edge, "... -> ... 1 1") # add h w
+    projections = projections - mean_edge
+    print("mean edge shape", mean_edge.shape)
+    print("test")
     # set variance 1, but for the full projection once it is fully padded
-    # Pad projection with zeros to make a larger size. FFT shift to edge
+    npix_template = projections.shape[-2] * projections.shape[-1]
+    npix_micrograph = micrographs.shape[-2] * micrographs.shape[-1]
+    mean_edge = edge_mean_reduction_2d(projections)
+    mean_edge = einops.rearrange(mean_edge, "... -> ... 1 1") # add h w
+    sum_squares = torch.sum(projections ** 2, dim=(-2, -1), keepdim=True)
+    variance = sum_squares * npix_template / npix_micrograph - ((mean_edge * npix_template / npix_micrograph) ** 2)
+    projections = projections / torch.sqrt(variance)
+    # Pad projections with zeros to size of micrographs
+    projections = pad_to_shape_2d(
+        image=projections,
+        image_shape=projections.shape[-2:],
+        shape=micrographs.shape[-2:],
+        pad_val=0,
+    )
+    print("projections padded shape", projections.shape)
+    # FFT shift to edge
+    projections = torch.fft.fftshift(projections, dim=(-2, -1))
     # do FFT and 0 central pixel
-
+    projections = torch.fft.rfftn(projections, dim=(-2, -1))
+    # zero central pixel
+    projections[:, 0, 0] = 0 + 0j
+    print("projections fft shape", projections.shape)
     # cross correlations
-
+    dft_micrographs_filtered = einops.rearrange(dft_micrographs_filtered, "nMic h w -> nMic 1 1 1 h w")
+    projections = projections.conj() * dft_micrographs_filtered
     # get max SNRs and best orientations and everything else.
-    #
+    print("projections shape", projections.shape)
 
 
 if __name__ == "__main__":
