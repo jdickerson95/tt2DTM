@@ -20,6 +20,41 @@ def _sinc2(shape: tuple[int, ...], rfft: bool, fftshift: bool) -> torch.Tensor:
     return torch.sinc(grid) ** 2
 
 
+# tidy up these next two functions, get someting going for now
+def fft_volume(
+    volume: torch.Tensor,
+    fftshift: bool = True,
+) -> torch.Tensor:
+    dft = torch.fft.fftshift(volume, dim=(-3, -2, -1))  # volume center to array origin
+    dft = torch.fft.rfftn(dft, dim=(-3, -2, -1))
+    if fftshift:
+        dft = torch.fft.fftshift(
+            dft,
+            dim=(
+                -3,
+                -2,
+            ),
+        )  # actual fftshift of 3D rfft
+    return dft
+
+
+def extract_fourier_slice(
+    dft_volume: torch.Tensor,
+    rotation_matrices: torch.Tensor,
+    volume_shape: tuple[int, int, int],
+) -> torch.Tensor:
+    # make projections by taking central slices
+    projections = extract_central_slices_rfft_3d(
+        volume_rfft=dft_volume,
+        image_shape=volume_shape,
+        rotation_matrices=rotation_matrices,
+    )  # (..., h, w) rfft stack
+
+    # FFT shift to original because ctf can only be applied to rfft or fftshift
+    projections = torch.fft.ifftshift(projections, dim=(-2,))  # ifftshift of 2D rfft
+    return projections
+
+
 def _rfft_slices_to_real_projections(
     fourier_slices: torch.Tensor,
 ) -> torch.Tensor:
