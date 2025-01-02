@@ -27,6 +27,12 @@ from tt2dtm.utils.io_handler import (
     tensor_to_mrc,
 )
 
+#Constants
+CCG_NOISE_STDEV = 1.0
+HISTOGRAM_NUM_POINTS = 512
+HISTOGRAM_MIN = -12.5
+HISTOGRAM_MAX = 22.5
+HISTOGRAM_STEP = (HISTOGRAM_MAX - HISTOGRAM_MIN) / HISTOGRAM_NUM_POINTS
 
 def run_tm(input_yaml: str):
     # read the input yaml file
@@ -87,7 +93,7 @@ def run_tm(input_yaml: str):
     combined_template_filter = combine_filters(whiten_template, bandpass_template)
     print("combined template filter shape", combined_template_filter.shape)
 
-        #Make sure mean zero after calc whiten to avoid div by zero
+    #Make sure mean zero after calc whiten to avoid div by zero
     dft_micrographs[:, 0, 0] = 0 + 0j
 
     ####MICROGRAPH OPERATIONS####
@@ -303,9 +309,9 @@ def run_tm(input_yaml: str):
     sum_correlation = sum_correlation * torch.sqrt(num_pixels)
     maximum_intensiy_projections = maximum_intensiy_projections * torch.sqrt(num_pixels)
     #Get the expected noise
-    CCG_NOISE_STDEV = 1.0
-    erf_input = 2.0 / (1.0 * num_pixels * total_correlation_positions)
-    inverse_c_erf = torch.erfinv(1 - erf_input)
+    erf_input = torch.tensor(2.0, dtype=torch.float64) / (torch.tensor(1.0, dtype=torch.float64) * num_pixels.to(torch.float64) * total_correlation_positions)
+    #erfc_input = torch.tensor(1.0, dtype=torch.float64) - erf_input
+    inverse_c_erf = torch.erfinv(torch.tensor(1.0, dtype=torch.float64) - erf_input)  
     expected_noise = (2**0.5) * CCG_NOISE_STDEV * inverse_c_erf
 
     #normalize
@@ -313,7 +319,11 @@ def run_tm(input_yaml: str):
     maximum_intensiy_projections_normalized = torch.where(sum_correlation_squared == 0, 
                                              torch.zeros_like(maximum_intensiy_projections_normalized),
                                              maximum_intensiy_projections_normalized / sum_correlation_squared)
-    #Get the SNR0-
+    
+
+
+
+    #Get the SNR0-§
     #write to file
     #max intensity to mrc called mip
     output_dir = all_inputs["outputs"]["output_directory"]
@@ -379,6 +389,41 @@ def run_tm(input_yaml: str):
     #write the best defoc, angles, pixel size/Cs
 
     #write survival histogram when I get one
+    print("Calculating survival histogram")
+    #Histogram stuff
+    histogram_min_scaled = HISTOGRAM_MIN / num_pixels**0.5
+    histogram_step_scaled = HISTOGRAM_STEP / num_pixels**0.5
+    # Create histogram for each micrograph
+    histogram_data = torch.zeros((projections.shape[0], HISTOGRAM_NUM_POINTS), device=projections.device)
+    
+    # Calculate bins using torch operations
+    bins = ((projections - histogram_min_scaled) / histogram_step_scaled).long()
+    # For each micrograph
+    for mic_idx in range(projections.shape[0]):
+        # Create a mask for valid bins (between 0 and histogram_number_of_points)
+        valid_mask = (bins[mic_idx] >= 0) & (bins[mic_idx] < HISTOGRAM_NUM_POINTS)
+        
+        # Use torch.bincount to count occurrences of each bin
+        # Only count values where the mask ßis True
+        valid_bins = bins[mic_idx][valid_mask]
+        histogram_data[mic_idx] = torch.bincount(
+            valid_bins, 
+            minlength=HISTOGRAM_NUM_POINTS
+        )
+    
+    temp_float = HISTOGRAM_MIN + (HISTOGRAM_STEP /2.0) # start pos
+    num_points = torch.arange(0, HISTOGRAM_NUM_POINTS)
+    expected_survival_hist = (torch.erfc((temp_float + HISTOGRAM_STEP *num_points) / 2.0**0.5)/2.0) * (num_pixels * total_correlation_positions)
+    # Calculate survival histogram (cumulative sum from right to left)
+    survival_histogram = torch.flip(torch.cumsum(torch.flip(histogram_data, [1]), dim=1), [1])
+    # Write hist to file
+    print("Writing survival histogram")
+    for j in range(projections.shape[0]):
+        with open(f"{output_dir}/survival_histogram_micrograph_{j+1}.txt", "w") as f:
+            f.write(f"Expected threshold is {expected_noise}\n")
+            f.write(f"SNR, histogram, survival histogram, random survival histogram\n")
+            for i in range(HISTOGRAM_NUM_POINTS):
+                f.write(f"{temp_float + HISTOGRAM_STEP *i}, {histogram_data[j, i]}, {survival_histogram[j, i]}, {expected_survival_hist[i]}\n")
 
 if __name__ == "__main__":
     run_tm("/Users/josh/git/teamtomo/tt2DTM/data/inputs.yaml")
