@@ -76,3 +76,4 @@ def edge_mean_reduction_2d(image: torch.Tensor):
     
     # Calculate mean across all edge pixels
     return torch.mean(edge_pixels, dim=(-2, -1))  # shape: (...)
+

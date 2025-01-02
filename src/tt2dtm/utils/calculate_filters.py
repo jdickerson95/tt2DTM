@@ -124,9 +124,22 @@ def get_Cs_range(
         pixel_size + pixel_size_range / 2 + eps,
         pixel_size_step,
     )
+    #If pixel_size not in pixel sizes add it, but keep it 1D
+    if pixel_size not in pixel_sizes:
+        pixel_sizes = torch.cat([pixel_sizes, torch.tensor([pixel_size])])
+
+    #re-sort pixel sizes
+    pixel_sizes = torch.sort(pixel_sizes)[0]
     Cs_values = Cs / torch.pow(pixel_sizes / pixel_size, 4)
     return Cs_values
 
+def Cs_to_pixel_size(
+    Cs_vals: torch.Tensor,
+    nominal_pixel_size: float,
+    nominal_Cs: float = 2.7,
+) -> torch.Tensor:
+    pixel_size = torch.pow(nominal_Cs / Cs_vals, 0.25) * nominal_pixel_size
+    return pixel_size
 
 def get_defocus_range(
     defocus_range: float,

@@ -103,6 +103,23 @@ def get_euler_angles(
     return all_angles
 
 
+def euler_to_rotation_matrix(euler_angles: torch.Tensor):
+    rotation_matrices = []
+    for euler_angle_tensor in euler_angles:
+        rotation_matrices.append(
+            torch.from_numpy(
+                euler2matrix(
+                    euler_angle_tensor.detach().numpy(),
+                    axes="zyz",
+                    intrinsic=True,
+                    right_handed_rotation=False,
+                )
+            ).float()
+        )
+
+    rotation_matrices = torch.stack(rotation_matrices, dim=0).squeeze(0)
+    return rotation_matrices
+
 def get_rotation_matrices(
     all_inputs: dict,
 ):
