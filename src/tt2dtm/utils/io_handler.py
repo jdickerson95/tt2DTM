@@ -7,6 +7,7 @@ import starfile
 import sys
 import yaml
 import numpy as np
+import pandas as pd
 
 
 def read_inputs(
@@ -115,6 +116,126 @@ def tensor_to_mrc(
         mrc.update_header_from_data()  # Automatically populates remaining fields
         mrc.header.rms = np.std(write_array)  # RMS deviation of the density values
 
+def write_mrc_files(
+    all_inputs: dict,
+    micrograph_data: pd.DataFrame,
+    maximum_intensiy_projections: torch.Tensor,
+    maximum_intensiy_projections_normalized: torch.Tensor,
+    sum_correlation: torch.Tensor,
+    sum_correlation_squared: torch.Tensor,
+    best_defoc: torch.Tensor,
+    best_phi: torch.Tensor,
+    best_theta: torch.Tensor,
+    best_psi: torch.Tensor,
+    best_pixel_size: torch.Tensor,
+) -> None:
+    """
+    Write mrc files for all micrographs
+
+    Parameters
+    ----------
+    all_inputs : dict
+        All inputs from the YAML file.
+    micrograph_data : pd.DataFrame
+        Micrograph data from the starfile.
+    maximum_intensiy_projections : torch.Tensor
+        Maximum intensity projections.
+    maximum_intensiy_projections_normalized : torch.Tensor
+        Maximum intensity projections normalized.
+    sum_correlation : torch.Tensor
+        Sum of correlation.
+    sum_correlation_squared : torch.Tensor
+        Sum of correlation squared.
+    best_defoc : torch.Tensor
+        Best defocus.
+    best_phi : torch.Tensor
+        Best phi.
+    best_theta : torch.Tensor
+        Best theta.
+    best_psi : torch.Tensor
+        Best psi.
+    best_pixel_size : torch.Tensor
+        Best pixel size.
+
+    Returns
+    -------
+    None
+    """
+    output_dir = all_inputs["outputs"]["output_directory"]
+    for i in range(maximum_intensiy_projections.shape[0]):
+        print(f"Writing mip for micrograph {i+1}")
+        tensor_to_mrc(
+            output_filename=f"{output_dir}/mip_micrograph_{i+1}.mrc",
+            final_array=maximum_intensiy_projections[i],
+            pixel_spacing=float(micrograph_data["rlnMicrographPixelSize"][0])
+        )
+        print(f"Writing scaled mip for micrograph {i+1}")
+        tensor_to_mrc(
+            output_filename=f"{output_dir}/scaled_mip_micrograph_{i+1}.mrc",
+            final_array=maximum_intensiy_projections_normalized[i],
+            pixel_spacing=float(micrograph_data["rlnMicrographPixelSize"][0])
+        )
+        print(f"Writing sum_correlation for micrograph {i+1}")
+        tensor_to_mrc(
+            output_filename=f"{output_dir}/corr_avg_micrograph_{i+1}.mrc",
+            final_array=sum_correlation[i],
+            pixel_spacing=float(micrograph_data["rlnMicrographPixelSize"][0])
+        )
+        print(f"Writing sum_corr_sqaured for micrograph {i+1}")
+        tensor_to_mrc(
+            output_filename=f"{output_dir}/corr_std_micrograph_{i+1}.mrc",
+            final_array=sum_correlation_squared[i],
+            pixel_spacing=float(micrograph_data["rlnMicrographPixelSize"][0])
+        )
+        print(f"Writing best defoc for micrograph {i+1}")
+        tensor_to_mrc(
+            output_filename=f"{output_dir}/best_defoc_micrograph_{i+1}.mrc",
+            final_array=best_defoc[i],
+            pixel_spacing=float(micrograph_data["rlnMicrographPixelSize"][0])
+        )
+        print(f"Writing best angles for micrograph {i+1}")
+        tensor_to_mrc(
+            output_filename=f"{output_dir}/best_phi_micrograph_{i+1}.mrc",
+            final_array=best_phi[i],
+            pixel_spacing=float(micrograph_data["rlnMicrographPixelSize"][0])
+        )
+        tensor_to_mrc(
+            output_filename=f"{output_dir}/best_theta_micrograph_{i+1}.mrc",
+            final_array=best_theta[i],
+            pixel_spacing=float(micrograph_data["rlnMicrographPixelSize"][0])
+        )
+        tensor_to_mrc(
+            output_filename=f"{output_dir}/best_psi_micrograph_{i+1}.mrc",
+            final_array=best_psi[i],
+            pixel_spacing=float(micrograph_data["rlnMicrographPixelSize"][0])
+        )
+        print(f"Writing best pixel size for micrograph {i+1}")
+        tensor_to_mrc(
+            output_filename=f"{output_dir}/best_pixel_size_micrograph_{i+1}.mrc",
+            final_array=best_pixel_size[i],
+            pixel_spacing=float(micrograph_data["rlnMicrographPixelSize"][0])
+        )
+
+def write_survival_histogram(
+    all_inputs: dict,
+    survival_histogram: torch.Tensor,
+    nMicrographs: int,
+    expected_noise: float,
+    histogram_data: torch.Tensor,
+    expected_survival_hist: torch.Tensor,
+    temp_float: float,
+    HISTOGRAM_STEP: float,
+    HISTOGRAM_NUM_POINTS: int,
+) -> None:
+    """Write survival histogram to file."""
+    output_dir = all_inputs["outputs"]["output_directory"]
+    print("Writing survival histogram")
+    for j in range(nMicrographs):
+        with open(f"{output_dir}/survival_histogram_micrograph_{j+1}.txt", "w") as f:
+            f.write(f"Expected threshold is {expected_noise}\n")
+            f.write(f"SNR, histogram, survival histogram, random survival histogram\n")
+            for i in range(HISTOGRAM_NUM_POINTS):
+                f.write(f"{temp_float + HISTOGRAM_STEP *i}, {histogram_data[j, i]}, {survival_histogram[j, i]}, {expected_survival_hist[i]}\n")
 # some functions here to convert parts of dict or df into tensors
 
 

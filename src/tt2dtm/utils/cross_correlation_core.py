@@ -3,6 +3,7 @@
 from typing import Literal
 
 import torch
+import einops
 from torch_fourier_slice.dft_utils import (
     fftshift_2d,
 )
@@ -319,3 +320,37 @@ def batched_cross_correlate_dft(
     )
 
     return cross_correlation
+
+def simple_cross_correlation(
+    projections: torch.Tensor,
+    dft_micrographs_filtered: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Simple cross correlation.
+
+    Parameters
+    ----------
+    projections : torch.Tensor
+        The projections to cross correlate.
+    dft_micrographs_filtered : torch.Tensor
+        The DFT of the micrographs filtered by the template.
+
+    Returns
+    -------
+    torch.Tensor
+        The cross correlated projections.
+    """
+    # FFT shift to edge
+    projections = torch.fft.fftshift(projections, dim=(-2, -1))
+    # do FFT and 0 central pixel
+    projections = torch.fft.rfftn(projections, dim=(-2, -1))
+    # zero central pixel
+    projections[:, 0, 0] = 0 + 0j
+    # cross correlations
+    dft_micrographs_filtered = einops.rearrange(dft_micrographs_filtered, "nMic h w -> nMic 1 1 1 h w")
+    projections = projections.conj() * dft_micrographs_filtered
+    
+    # Inverse FFT this MIP
+    projections = torch.fft.irfftn(projections, dim=(-2, -1))
+
+    return projections

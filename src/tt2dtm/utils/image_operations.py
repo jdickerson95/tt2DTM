@@ -1,6 +1,7 @@
 
 import torch
 import torch.nn.functional as F
+import einops
 
 def is_efficient_size(n, radices):
     """Check if a number can be factored using only the given radices."""
@@ -77,3 +78,22 @@ def edge_mean_reduction_2d(image: torch.Tensor):
     # Calculate mean across all edge pixels
     return torch.mean(edge_pixels, dim=(-2, -1))  # shape: (...)
 
+def mean_zero_var_one_full_size(
+        projections: torch.Tensor,
+        micrographs_shape: tuple[int, int],
+):
+        #. Subtract mean of edge (mean 0)
+    mean_edge = edge_mean_reduction_2d(projections)
+    mean_edge = einops.rearrange(mean_edge, "... -> ... 1 1") # add h w
+    projections = projections - mean_edge
+    # set variance 1, but for the full projection once it is fully padded
+    npix_template = projections.shape[-2] * projections.shape[-1]
+    npix_micrograph = micrographs_shape[-2] * micrographs_shape[-1]
+    mean_edge = edge_mean_reduction_2d(projections)
+    mean_edge = einops.rearrange(mean_edge, "... -> ... 1 1") # add h w
+    sum_squares = torch.sum(projections ** 2, dim=(-2, -1), keepdim=True)
+    variance = sum_squares * npix_template / npix_micrograph - ((mean_edge * npix_template / npix_micrograph) ** 2)
+
+    projections = projections / torch.sqrt(variance)
+
+    return projections

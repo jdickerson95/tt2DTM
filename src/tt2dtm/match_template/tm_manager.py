@@ -7,9 +7,8 @@ import torch
 from torch_fourier_filter.ctf import calculate_ctf_2d
 from torch_fourier_filter.phase_randomize import phase_randomize
 
-from tt2dtm.match_template.load_angles import euler_to_rotation_matrix, get_euler_angles, get_rotation_matrices
+from tt2dtm.match_template.load_angles import euler_to_rotation_matrix, get_euler_angles
 from tt2dtm.utils.calculate_filters import (
-    Cs_to_pixel_size,
     calculate_2d_template_filters,
     calculate_micrograph_filters,
     combine_filters,
@@ -17,22 +16,111 @@ from tt2dtm.utils.calculate_filters import (
     get_defocus_range,
     get_defocus_values,
 )
+from tt2dtm.utils.cross_correlation_core import simple_cross_correlation
 from tt2dtm.utils.fourier_slice import _sinc2, extract_fourier_slice, fft_volume
-from tt2dtm.utils.image_operations import pad_to_shape_2d, pad_volume, edge_mean_reduction_2d
+from tt2dtm.utils.image_operations import mean_zero_var_one_full_size, pad_to_shape_2d, pad_volume, edge_mean_reduction_2d
 from tt2dtm.utils.io_handler import (
     load_mrc_map,
     load_mrc_micrographs,
     load_relion_starfile,
     read_inputs,
-    tensor_to_mrc,
 )
+from tt2dtm.match_template.process_match_results import process_match_results_all
 
-#Constants
-CCG_NOISE_STDEV = 1.0
-HISTOGRAM_NUM_POINTS = 512
-HISTOGRAM_MIN = -12.5
-HISTOGRAM_MAX = 22.5
-HISTOGRAM_STEP = (HISTOGRAM_MAX - HISTOGRAM_MIN) / HISTOGRAM_NUM_POINTS
+def get_search_ranges(
+    all_inputs: dict, 
+    micrograph_data: dict
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Get the search ranges for Cs, defocus_u, and defocus_v
+    Parameters
+    ----------  
+    all_inputs: dict
+        The input dictionary
+    micrograph_data: dict
+        The micrograph data dictionary
+
+    Returns
+    -------
+    Cs_vals: torch.Tensor
+        The search ranges for Cs
+    defoc_u_vals: torch.Tensor
+        The search ranges for defocus_u
+    defoc_v_vals: torch.Tensor
+        The search ranges for defocus_v
+    """
+    Cs_vals = torch.tensor(
+        float(micrograph_data["rlnSphericalAberration"][0]), dtype=torch.float32
+    )
+
+    if all_inputs["extra_searches"]["pixel_size_search"]["enabled"]:
+        Cs_vals = get_Cs_range(
+            pixel_size=float(micrograph_data["rlnMicrographPixelSize"][0]),
+            pixel_size_range=all_inputs["extra_searches"]["pixel_size_search"]["range"],
+            pixel_size_step=all_inputs["extra_searches"]["pixel_size_search"][
+                "step_size"
+            ],
+            Cs=Cs_vals,
+        )
+    print("Cs vals shape", Cs_vals.shape)
+    # Calculate defocus range for each micrograph
+    defoc_u_vals = torch.tensor(micrograph_data["rlnDefocusU"], dtype=torch.float32)
+    defoc_v_vals = torch.tensor(micrograph_data["rlnDefocusV"], dtype=torch.float32)
+    if all_inputs["extra_searches"]["defocus_search"]["enabled"]:
+        defoc_range = get_defocus_range(
+            defocus_range=float(
+                all_inputs["extra_searches"]["defocus_search"]["range"]
+            ),
+            defocus_step=float(
+                all_inputs["extra_searches"]["defocus_search"]["step_size"]
+            ),
+        )
+        # get defoc range for each micrograph
+        defoc_u_vals = get_defocus_values(
+            defoc_vals=defoc_u_vals,
+            defoc_range=defoc_range,
+        )
+        defoc_v_vals = get_defocus_values(
+            defoc_vals=defoc_v_vals,
+            defoc_range=defoc_range,
+        )
+
+    return Cs_vals, defoc_u_vals, defoc_v_vals
+
+def get_ctf(
+    defocus_values: torch.Tensor,
+    defoc_u_vals: torch.Tensor,
+    defoc_v_vals: torch.Tensor,
+    micrograph_data: dict,
+    Cs_vals: torch.Tensor,
+    mrc_map_shape: tuple[int, int],
+) -> torch.Tensor:
+    astigmatism_values = (defoc_u_vals - defoc_v_vals) / 2
+    astigmatism_angle = torch.tensor(
+        micrograph_data["rlnDefocusAngle"], dtype=torch.float32
+    )
+    # broadcast with einops to match defocus values
+    astigmatism_angle = einops.rearrange(astigmatism_angle, "n -> n 1")
+    ctf_2d = calculate_ctf_2d(
+        defocus=defocus_values * 1e-4,  # convert to microns
+        astigmatism=astigmatism_values * 1e-4,  # convert to microns
+        astigmatism_angle=astigmatism_angle,
+        pixel_size=float(micrograph_data["rlnMicrographPixelSize"][0]),
+        voltage=float(micrograph_data["rlnVoltage"][0]),
+        spherical_aberration=Cs_vals,
+        amplitude_contrast=float(micrograph_data["rlnAmplitudeContrast"][0]),
+        b_factor=0,
+        phase_shift=0,
+        image_shape=mrc_map_shape[-2:],
+        rfft=True,
+        fftshift=False,
+    )  # shape needs to be (n_micrographs, n_Cs, n_defoc, h, w)
+    print("ctf shape", ctf_2d.shape)
+    # if ctf only four dimensions, rearrange to 5 (add Cs dimension)
+    if ctf_2d.ndim == 4:
+        ctf_2d = einops.rearrange(ctf_2d, "nMic nDefoc h w -> nMic nDefoc 1 h w")
+    print("ctf shape", ctf_2d.shape)
+    return ctf_2d
 
 def run_tm(input_yaml: str):
     # read the input yaml file
@@ -93,10 +181,11 @@ def run_tm(input_yaml: str):
     combined_template_filter = combine_filters(whiten_template, bandpass_template)
     print("combined template filter shape", combined_template_filter.shape)
 
-    #Make sure mean zero after calc whiten to avoid div by zero
-    dft_micrographs[:, 0, 0] = 0 + 0j
+
 
     ####MICROGRAPH OPERATIONS####
+    #Make sure mean zero after calc whiten to avoid div by zero
+    dft_micrographs[:, 0, 0] = 0 + 0j
     # Apply the filter to the micrographs and phase random if wanted
     dft_micrographs_filtered = dft_micrographs * combined_micrograph_filter
     if all_inputs["filters"]["phase_randomize"]["enabled"]:
@@ -119,43 +208,28 @@ def run_tm(input_yaml: str):
     ####TEMPLATE STUFF####
     # Calculate range of Cs values of pixel size search
     # Cs_vals = torch.tensor(float(micrograph_data['rlnSphericalAberration'][0]))
-    Cs_vals = torch.tensor(
-        float(micrograph_data["rlnSphericalAberration"][0]), dtype=torch.float32
+    Cs_vals, defoc_u_vals, defoc_v_vals = get_search_ranges(
+        all_inputs=all_inputs,
+        micrograph_data=micrograph_data,
     )
-    if all_inputs["extra_searches"]["pixel_size_search"]["enabled"]:
-        Cs_vals = get_Cs_range(
-            pixel_size=float(micrograph_data["rlnMicrographPixelSize"][0]),
-            pixel_size_range=all_inputs["extra_searches"]["pixel_size_search"]["range"],
-            pixel_size_step=all_inputs["extra_searches"]["pixel_size_search"][
-                "step_size"
-            ],
-            Cs=Cs_vals,
-        )
-    print("Cs vals shape", Cs_vals.shape)
-    # Calculate defocus range for each micrograph
-    defoc_u_vals = torch.tensor(micrograph_data["rlnDefocusU"], dtype=torch.float32)
-    defoc_v_vals = torch.tensor(micrograph_data["rlnDefocusV"], dtype=torch.float32)
-    if all_inputs["extra_searches"]["defocus_search"]["enabled"]:
-        defoc_range = get_defocus_range(
-            defocus_range=float(
-                all_inputs["extra_searches"]["defocus_search"]["range"]
-            ),
-            defocus_step=float(
-                all_inputs["extra_searches"]["defocus_search"]["step_size"]
-            ),
-        )
-        # get defoc range for each micrograph
-        defoc_u_vals = get_defocus_values(
-            defoc_vals=defoc_u_vals,
-            defoc_range=defoc_range,
-        )
-        defoc_v_vals = get_defocus_values(
-            defoc_vals=defoc_v_vals,
-            defoc_range=defoc_range,
-        )
-
+    defocus_values = (defoc_u_vals + defoc_v_vals) / 2
     print("defocus shapes", defoc_u_vals.shape, defoc_v_vals.shape)
     # Calculate size needed for 2D projection based on Cs/CTF.
+    ctf_2d = get_ctf(
+        defocus_values=defocus_values,
+        defoc_u_vals=defoc_u_vals,
+        defoc_v_vals=defoc_v_vals,
+        micrograph_data=micrograph_data,
+        Cs_vals=Cs_vals,
+        mrc_map_shape=mrc_map.shape,
+    )
+    # multiply ctf by filters
+    combined_template_filter = einops.rearrange(
+        combined_template_filter, "nMic h w -> nMic 1 1 h w"
+    )
+    combined_template_filter = combined_template_filter * ctf_2d
+    print("combined template filter shape", combined_template_filter.shape)
+
 
     #### Extract Fourier slice at angles ####
     # Multiply map by sinc2
@@ -173,41 +247,6 @@ def run_tm(input_yaml: str):
     )  # shape (n_angles, h, w)
     print("done projections")
     print("projections shape", projections.shape)
-    # Calculate CTFs and multiply them with the filters
-    defocus_values = (defoc_u_vals + defoc_v_vals) / 2
-    astigmatism_values = (defoc_u_vals - defoc_v_vals) / 2
-    astigmatism_angle = torch.tensor(
-        micrograph_data["rlnDefocusAngle"], dtype=torch.float32
-    )
-    astigmatism_angle = einops.rearrange(astigmatism_angle, "n -> n 1")
-    # broadcast with einops to match defocus values
-
-    ctf_2d = calculate_ctf_2d(
-        defocus=defocus_values * 1e-4,  # convert to microns
-        astigmatism=astigmatism_values * 1e-4,  # convert to microns
-        astigmatism_angle=astigmatism_angle,
-        pixel_size=float(micrograph_data["rlnMicrographPixelSize"][0]),
-        voltage=float(micrograph_data["rlnVoltage"][0]),
-        spherical_aberration=Cs_vals,
-        amplitude_contrast=float(micrograph_data["rlnAmplitudeContrast"][0]),
-        b_factor=0,
-        phase_shift=0,
-        image_shape=mrc_map.shape[-2:],
-        rfft=True,
-        fftshift=False,
-    )  # shape needs to be (n_micrographs, n_Cs, n_defoc, h, w)
-    print("ctf shape", ctf_2d.shape)
-    # if ctf only four dimensions, rearrange to 5 (add Cs dimension)
-    if ctf_2d.ndim == 4:
-        ctf_2d = einops.rearrange(ctf_2d, "nMic nDefoc h w -> nMic nDefoc 1 h w")
-    print("ctf shape", ctf_2d.shape)
-    # multiply ctf by filters
-    combined_template_filter = einops.rearrange(
-        combined_template_filter, "nMic h w -> nMic 1 1 h w"
-    )
-    combined_template_filter = combined_template_filter * ctf_2d
-    print("combined template filter shape", combined_template_filter.shape)
-
 
     # Apply the combined filters to projections
     #the final shape will now be (n_micrographs, n_defoc, n_Cs, n_angles, h, w)
@@ -218,24 +257,16 @@ def run_tm(input_yaml: str):
     projections = projections * combined_template_filter
     print("projections shape", projections.shape)
     print("projections filtered")
+
     # Backwards FFT
     projections = torch.fft.irfftn(projections, dim=(-2, -1))
     #flip contrast
     projections = projections * -1
-    #. Subtract mean of edge (mean 0)
-    mean_edge = edge_mean_reduction_2d(projections)
-    mean_edge = einops.rearrange(mean_edge, "... -> ... 1 1") # add h w
-    projections = projections - mean_edge
-    print("mean edge shape", mean_edge.shape)
-    print("test")
-    # set variance 1, but for the full projection once it is fully padded
-    npix_template = projections.shape[-2] * projections.shape[-1]
-    npix_micrograph = micrographs.shape[-2] * micrographs.shape[-1]
-    mean_edge = edge_mean_reduction_2d(projections)
-    mean_edge = einops.rearrange(mean_edge, "... -> ... 1 1") # add h w
-    sum_squares = torch.sum(projections ** 2, dim=(-2, -1), keepdim=True)
-    variance = sum_squares * npix_template / npix_micrograph - ((mean_edge * npix_template / npix_micrograph) ** 2)
-    projections = projections / torch.sqrt(variance)
+    #. Subtract mean of edge (mean 0) and set variance 1 (full size)
+    projections = mean_zero_var_one_full_size(
+        projections=projections,
+        micrographs_shape=micrographs.shape[-2:],
+    )
     # Pad projections with zeros to size of micrographs
     projections = pad_to_shape_2d(
         image=projections,
@@ -244,186 +275,22 @@ def run_tm(input_yaml: str):
         pad_val=0,
     )
     print("projections padded shape", projections.shape)
-    # FFT shift to edge
-    projections = torch.fft.fftshift(projections, dim=(-2, -1))
-    # do FFT and 0 central pixel
-    projections = torch.fft.rfftn(projections, dim=(-2, -1))
-    # zero central pixel
-    projections[:, 0, 0] = 0 + 0j
-    print("projections fft shape", projections.shape)
-    # cross correlations
-    dft_micrographs_filtered = einops.rearrange(dft_micrographs_filtered, "nMic h w -> nMic 1 1 1 h w")
-    projections = projections.conj() * dft_micrographs_filtered
+    # cross correlation
+    projections = simple_cross_correlation(
+        projections=projections,
+        dft_micrographs_filtered=dft_micrographs_filtered,
+    )
     
-    print("projections shape", projections.shape)
-    # Inverse FFT this MIP
-    projections = torch.fft.irfftn(projections, dim=(-2, -1))
-    
-    #Get all the max values and indices
-    # Flatten the dimensions you're reducing over
-    flattened = einops.rearrange(projections, "nMic nDefoc nCs nAng h w -> nMic (nDefoc nCs nAng) h w")
-    maximum_intensiy_projections, flat_indices = torch.max(flattened, dim=1)  # Reduces along the combined dimension (nDefoc*nCs*nAng)
-    nDefoc, nCs, nAng = projections.shape[1:4]
-    defoc_indices = (flat_indices // (nCs * nAng)) % nDefoc
-    cs_indices = (flat_indices // nAng) % nCs
-    ang_indices = flat_indices % nAng
-
-    print("defoc indices", defoc_indices.shape)
-    print("cs indices", cs_indices.shape)
-    print("ang indices", ang_indices.shape)
-    best_defoc = defocus_values[
-        torch.arange(defocus_values.shape[0]).unsqueeze(-1).unsqueeze(-1),  # nMic dimension
-        defoc_indices  # Contains indices for each spatial position
-    ]  # Result shape: (nMic, h, w)
-    best_cs = Cs_vals[cs_indices]
-    best_angles = euler_angles[ang_indices]
-
-    #convert Cs back to pixel size
-    best_pixel_size = Cs_to_pixel_size(
-        Cs_vals=best_cs,
-        nominal_pixel_size=float(micrograph_data["rlnMicrographPixelSize"][0]),
-        nominal_Cs=float(micrograph_data["rlnSphericalAberration"][0]) * 1E7
+    process_match_results_all(
+        all_inputs=all_inputs,
+        projections=projections,
+        defocus_values=defocus_values,
+        Cs_vals=Cs_vals,
+        euler_angles=euler_angles,
+        micrograph_data=micrograph_data,
     )
 
-    print("best defoc", best_defoc.shape)
-    print("best cs", best_cs.shape)
-    print("best angles", best_angles.shape)
-    print("max intensity projections", maximum_intensiy_projections.shape)
-    #get best phi, theta, psi
-    best_phi = best_angles[..., 0]
-    best_theta = best_angles[..., 1]
-    best_psi = best_angles[..., 2]
-    print("best phi", best_phi.shape)
-    print("best theta", best_theta.shape)
-    print("best psi", best_psi.shape)
-    # get max SNRs and stuff
-    
-    #sum all xcorr per micrograph
-    sum_correlation = einops.reduce(projections, "nMic nDefoc nCs nAng h w -> nMic h w", "sum")
-    sum_correlation_squared = einops.reduce(projections ** 2, "nMic nDefoc nCs nAng h w -> nMic h w", "sum")
-    total_correlation_positions = projections.shape[1] * projections.shape[2] * projections.shape[3]
-    num_pixels = torch.tensor(projections.shape[-2] * projections.shape[-1], dtype=torch.float32)
-    sum_correlation = sum_correlation / total_correlation_positions
-    sum_correlation_squared = sum_correlation_squared / total_correlation_positions - (sum_correlation ** 2)
-    sum_correlation_squared = torch.sqrt(torch.clamp(sum_correlation_squared, min=0)) * torch.sqrt(num_pixels)
-    sum_correlation = sum_correlation * torch.sqrt(num_pixels)
-    maximum_intensiy_projections = maximum_intensiy_projections * torch.sqrt(num_pixels)
-    #Get the expected noise
-    erf_input = torch.tensor(2.0, dtype=torch.float64) / (torch.tensor(1.0, dtype=torch.float64) * num_pixels.to(torch.float64) * total_correlation_positions)
-    #erfc_input = torch.tensor(1.0, dtype=torch.float64) - erf_input
-    inverse_c_erf = torch.erfinv(torch.tensor(1.0, dtype=torch.float64) - erf_input)  
-    expected_noise = (2**0.5) * CCG_NOISE_STDEV * inverse_c_erf
 
-    #normalize
-    maximum_intensiy_projections_normalized = maximum_intensiy_projections - sum_correlation
-    maximum_intensiy_projections_normalized = torch.where(sum_correlation_squared == 0, 
-                                             torch.zeros_like(maximum_intensiy_projections_normalized),
-                                             maximum_intensiy_projections_normalized / sum_correlation_squared)
-    
-
-
-
-    #Get the SNR0-§
-    #write to file
-    #max intensity to mrc called mip
-    output_dir = all_inputs["outputs"]["output_directory"]
-    for i in range(maximum_intensiy_projections.shape[0]):
-        print(f"Writing mip for micrograph {i+1}")
-        tensor_to_mrc(
-            output_filename=f"{output_dir}/mip_micrograph_{i+1}.mrc",
-            final_array=maximum_intensiy_projections[i],
-            pixel_spacing=float(micrograph_data["rlnMicrographPixelSize"][0])
-        )
-        print(f"Writing scaled mip for micrograph {i+1}")
-        tensor_to_mrc(
-            output_filename=f"{output_dir}/scaled_mip_micrograph_{i+1}.mrc",
-            final_array=maximum_intensiy_projections_normalized[i],
-            pixel_spacing=float(micrograph_data["rlnMicrographPixelSize"][0])
-        )
-        print(f"Writing sum_correlation for micrograph {i+1}")
-        tensor_to_mrc(
-            output_filename=f"{output_dir}/corr_avg_micrograph_{i+1}.mrc",
-            final_array=sum_correlation[i],
-            pixel_spacing=float(micrograph_data["rlnMicrographPixelSize"][0])
-        )
-        print(f"Writing sum_corr_sqaured for micrograph {i+1}")
-        tensor_to_mrc(
-            output_filename=f"{output_dir}/corr_std_micrograph_{i+1}.mrc",
-            final_array=sum_correlation_squared[i],
-            pixel_spacing=float(micrograph_data["rlnMicrographPixelSize"][0])
-        )
-        print(f"Writing best defoc for micrograph {i+1}")
-        tensor_to_mrc(
-            output_filename=f"{output_dir}/best_defoc_micrograph_{i+1}.mrc",
-            final_array=best_defoc[i],
-            pixel_spacing=float(micrograph_data["rlnMicrographPixelSize"][0])
-        )
-        print(f"Writing best angles for micrograph {i+1}")
-        tensor_to_mrc(
-            output_filename=f"{output_dir}/best_phi_micrograph_{i+1}.mrc",
-            final_array=best_phi[i],
-            pixel_spacing=float(micrograph_data["rlnMicrographPixelSize"][0])
-        )
-        tensor_to_mrc(
-            output_filename=f"{output_dir}/best_theta_micrograph_{i+1}.mrc",
-            final_array=best_theta[i],
-            pixel_spacing=float(micrograph_data["rlnMicrographPixelSize"][0])
-        )
-        tensor_to_mrc(
-            output_filename=f"{output_dir}/best_psi_micrograph_{i+1}.mrc",
-            final_array=best_psi[i],
-            pixel_spacing=float(micrograph_data["rlnMicrographPixelSize"][0])
-        )
-        print(f"Writing best pixel size for micrograph {i+1}")
-        tensor_to_mrc(
-            output_filename=f"{output_dir}/best_pixel_size_micrograph_{i+1}.mrc",
-            final_array=best_pixel_size[i],
-            pixel_spacing=float(micrograph_data["rlnMicrographPixelSize"][0])
-        )
-        print(f"Writing best Cs for micrograph {i+1}")
-        tensor_to_mrc(
-            output_filename=f"{output_dir}/best_Cs_micrograph_{i+1}.mrc",
-            final_array=best_cs[i],
-            pixel_spacing=float(micrograph_data["rlnMicrographPixelSize"][0])
-        )
-    #write the best defoc, angles, pixel size/Cs
-
-    #write survival histogram when I get one
-    print("Calculating survival histogram")
-    #Histogram stuff
-    histogram_min_scaled = HISTOGRAM_MIN / num_pixels**0.5
-    histogram_step_scaled = HISTOGRAM_STEP / num_pixels**0.5
-    # Create histogram for each micrograph
-    histogram_data = torch.zeros((projections.shape[0], HISTOGRAM_NUM_POINTS), device=projections.device)
-    
-    # Calculate bins using torch operations
-    bins = ((projections - histogram_min_scaled) / histogram_step_scaled).long()
-    # For each micrograph
-    for mic_idx in range(projections.shape[0]):
-        # Create a mask for valid bins (between 0 and histogram_number_of_points)
-        valid_mask = (bins[mic_idx] >= 0) & (bins[mic_idx] < HISTOGRAM_NUM_POINTS)
-        
-        # Use torch.bincount to count occurrences of each bin
-        # Only count values where the mask ßis True
-        valid_bins = bins[mic_idx][valid_mask]
-        histogram_data[mic_idx] = torch.bincount(
-            valid_bins, 
-            minlength=HISTOGRAM_NUM_POINTS
-        )
-    
-    temp_float = HISTOGRAM_MIN + (HISTOGRAM_STEP /2.0) # start pos
-    num_points = torch.arange(0, HISTOGRAM_NUM_POINTS)
-    expected_survival_hist = (torch.erfc((temp_float + HISTOGRAM_STEP *num_points) / 2.0**0.5)/2.0) * (num_pixels * total_correlation_positions)
-    # Calculate survival histogram (cumulative sum from right to left)
-    survival_histogram = torch.flip(torch.cumsum(torch.flip(histogram_data, [1]), dim=1), [1])
-    # Write hist to file
-    print("Writing survival histogram")
-    for j in range(projections.shape[0]):
-        with open(f"{output_dir}/survival_histogram_micrograph_{j+1}.txt", "w") as f:
-            f.write(f"Expected threshold is {expected_noise}\n")
-            f.write(f"SNR, histogram, survival histogram, random survival histogram\n")
-            for i in range(HISTOGRAM_NUM_POINTS):
-                f.write(f"{temp_float + HISTOGRAM_STEP *i}, {histogram_data[j, i]}, {survival_histogram[j, i]}, {expected_survival_hist[i]}\n")
 
 if __name__ == "__main__":
     run_tm("/Users/josh/git/teamtomo/tt2DTM/data/inputs.yaml")
