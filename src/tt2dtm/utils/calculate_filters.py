@@ -162,7 +162,7 @@ def get_defocus_values(
     return defoc_vals
 
 
-def get_max_box_size(
+def get_min_box_size(
     micrograph_data: dict,
     max_Cs: float,
     max_defocus: float,
