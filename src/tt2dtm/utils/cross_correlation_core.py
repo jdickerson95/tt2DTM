@@ -1,6 +1,10 @@
 """Core cross-correlation methods for single and stacks of image/templates."""
 
 from typing import Literal
+import os
+
+# Set the environment variable before importing PyTorch
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import torch
 import einops
@@ -355,6 +359,81 @@ def simple_cross_correlation(
 
     return projections
 
+
+def simple_cross_correlation_single(
+    projections: torch.Tensor,
+    dft_micrographs_filtered: torch.Tensor,
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    Simple cross correlation with memory tracking.
+
+    Parameters
+    ----------
+    projections : torch.Tensor
+        The projections to cross correlate.
+    dft_micrographs_filtered : torch.Tensor
+        The DFT of the micrographs filtered by the template.
+
+    Returns
+    -------
+    torch.Tensor
+        The cross correlated projections.
+    """
+    #print if projections on gpu or cpu
+    print(f"Projections on GPU: {projections.device.type == 'cuda'}")
+    #print device tensors are on
+    print(f"Device tensors are on: {torch.cuda.current_device()}")
+
+    def print_memory_usage(step):
+        #torch.cuda.synchronize(device)  # Ensure all operations are complete on the specified device
+        print(f"{step}: Allocated: {torch.cuda.memory_allocated(device) / (1024**3):.2f} GB, Reserved: {torch.cuda.memory_reserved(device) / (1024**3):.2f} GB")
+
+    # Set the current device context
+    torch.cuda.set_device(device)
+
+    print_memory_usage("Before fftshift") 
+    # FFT shift to edge
+    print("proj data type", projections.dtype)
+    projections_shifted = torch.fft.fftshift(projections, dim=(-2, -1))
+    print("proj_shifted data type", projections_shifted.dtype)
+    print_memory_usage("After fftshift")
+    del projections
+    torch.cuda.empty_cache()
+    print_memory_usage("After fftshift and delete")
+
+
+    # do FFT and 0 central pixel
+    projections_fft = torch.fft.rfftn(projections_shifted, dim=(-2, -1))
+    print_memory_usage("After rfftn")
+    del projections_shifted
+    torch.cuda.empty_cache()
+    print_memory_usage("After rfftn and delete")
+
+
+    # zero central pixel
+    projections_fft[:, 0, 0] = 0 + 0j
+    print_memory_usage("After zeroing central pixel")
+
+    # cross correlations
+    dft_micrographs_filtered = einops.rearrange(dft_micrographs_filtered, "h w -> 1 1 1 h w")
+    projections_fft = projections_fft.conj()
+    xc_map_fft = projections_fft * dft_micrographs_filtered
+    print_memory_usage("After cross correlation")
+    del projections_fft
+    torch.cuda.empty_cache()
+    print_memory_usage("After cross correlation and delete")
+
+    # Inverse FFT this MIP
+    xc_map = torch.fft.irfftn(xc_map_fft, dim=(-2, -1))
+    print_memory_usage("After irfftn")
+    del xc_map_fft
+    torch.cuda.empty_cache()
+    print_memory_usage("After irfftn and delete")
+
+    return xc_map
+
+'''
 def simple_cross_correlation_single(
     projections: torch.Tensor,
     dft_micrographs_filtered: torch.Tensor,
@@ -382,10 +461,11 @@ def simple_cross_correlation_single(
     projections[:, 0, 0] = 0 + 0j
     # cross correlations
     dft_micrographs_filtered = einops.rearrange(dft_micrographs_filtered, "h w -> 1 1 1 h w")
-    projections = projections.conj() * dft_micrographs_filtered
+    projections = projections.conj()
+    projections = projections * dft_micrographs_filtered
     
     # Inverse FFT this MIP
     projections = torch.fft.irfftn(projections, dim=(-2, -1))
 
     return projections
-
+'''

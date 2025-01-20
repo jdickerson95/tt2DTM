@@ -2,6 +2,12 @@
 # mrc map, micrographs, ctf's, output dir, px size, etc.
 
 # It will mainly follow torch 2dtm package stuff
+
+import os
+
+# Set the environment variable before importing PyTorch
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 import einops
 import torch
 from torch_fourier_filter.ctf import calculate_ctf_2d
@@ -26,7 +32,7 @@ from tt2dtm.utils.io_handler import (
     read_inputs,
 )
 from tt2dtm.match_template.process_match_results import get_mip_and_best_single_mic, process_match_results_all, process_match_results_single
-from tt2dtm.utils.memory_utils import calculate_batch_size
+from tt2dtm.utils.memory_utils import calculate_batch_size, get_gpu_with_most_memory
 
 def get_search_ranges(
     all_inputs: dict, 
@@ -680,8 +686,14 @@ def run_tm_gpu_batch_1(input_yaml: str):
         #now batch the angles
         #batch_size = 10  # Can be tuned based on memory
 
-        device = torch.device('cuda')
+        device = get_gpu_with_most_memory()
+
         # = torch.device('cpu')
+
+        # Move input tensors to GPU
+        defocus_values_gpu = defocus_values[i].to(device)
+        Cs_vals_gpu = Cs_vals.to(device)
+        euler_angles_gpu = euler_angles.to(device)
 
         batch_size = calculate_batch_size(
             micrograph_shape=micrograph.shape[-2:],
@@ -705,28 +717,51 @@ def run_tm_gpu_batch_1(input_yaml: str):
         maximum_intensiy_projection = torch.zeros(micrograph.shape[-2:], dtype=torch.float32, device=device)
 
         combined_template_filter = einops.rearrange(combined_template_filter, "nDefoc nCs h w -> nDefoc nCs 1 h w").to(device)
+
+        # Move dft_map to device
+        dft_map = dft_map.to(device)
+        mrc_map_shape = torch.tensor(mrc_map.shape, device=device)
+        dft_micrograph = dft_micrograph.to(device)
+
+        start_mic_time = time.time()
         
         for batch_idx in range(num_batches):
             start_idx = batch_idx * batch_size
             end_idx = min((batch_idx + 1) * batch_size, num_angles)
             batch_matrices = rotation_matrices[start_idx:end_idx].to(device)
             batch_euler_angles = euler_angles[start_idx:end_idx].to(device)
+
+            
             proj = extract_fourier_slice(
                 dft_volume=dft_map,
                 rotation_matrices=batch_matrices,
-                volume_shape=mrc_map.shape,
+                volume_shape=mrc_map_shape,
             )
             # Rearrange and multiply with template filter
             proj = einops.rearrange(proj, "nAng h w -> 1 1 nAng h w")
             proj = proj * combined_template_filter
+
+            #print memoery size of proj
+            print(f"elem size {proj.element_size()}")
+            print(f"numel {proj.numel() / (micrograph.shape[-2] * micrograph.shape[-1])} ")
+            print("proj size", (proj.numel() * proj.element_size()) / 1024**3)
+            #print proj data type
+            print("proj data type", proj.dtype)
+            print(f"proj shape {proj.shape}")
                 
             # Backwards FFT
             proj = torch.fft.irfftn(proj, dim=(-2, -1))
-                
+
+            #print memoery size of proj
+            print("proj size", (proj.numel() * proj.element_size()) / 1024**3)
+            #print proj data type
+            print("proj data type", proj.dtype)
+            print(f"proj shape {proj.shape}")
+
             # Flip contrast
             proj = proj * -1
                 
-            # Mean zero var one
+            # Mean zero var one            print("proj size", (proj.numel() * proj.element_size()) / 1024**3)
             proj = mean_zero_var_one_full_size(
                 projections=proj,
                 micrographs_shape=micrograph.shape[-2:],
@@ -741,12 +776,50 @@ def run_tm_gpu_batch_1(input_yaml: str):
                 shape=micrograph.shape[-2:],
                 pad_val=0,
             )
+
+            #print memoery size of proj
+            print("proj size", (proj.numel() * proj.element_size()) / 1024**3)
+            #print proj data type
+            print("proj data type", proj.dtype)
+            print(f"proj shape {proj.shape}")
                 
             # Cross correlation
+            '''
             proj = simple_cross_correlation_single(
                 projections=proj,
                 dft_micrographs_filtered=dft_micrograph.to(device),
+                device=device,
             )
+            '''
+
+            #Do this here instead have having in place operation memory issues
+            proj = torch.fft.fftshift(proj, dim=(-2, -1))
+            proj = torch.fft.rfftn(proj, dim=(-2, -1))
+            proj[:, 0, 0] = 0 + 0j
+            proj = proj.conj()
+            proj = proj * dft_micrograph
+            proj = torch.fft.irfftn(proj, dim=(-2, -1))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+            #print memoery size of proj
+            print("proj size", (proj.numel() * proj.element_size()) / 1024**3)
+            #print proj data type
+            print("proj data type", proj.dtype)
+            print(f"proj shape {proj.shape}")
+
             print(f"mean proj = {proj.mean()}")
             #Need to process each batch to get best and max, update sum corr and histogram
             sum_correlation = sum_correlation + einops.reduce(proj, "nDefoc nCs nAng h w -> h w", "sum")
@@ -754,9 +827,9 @@ def run_tm_gpu_batch_1(input_yaml: str):
             #Get best and max
             this_best_defoc, this_best_pixel_size, this_best_phi, this_best_theta, this_best_psi, this_maximum_intensiy_projection = get_mip_and_best_single_mic(
                 projections=proj,
-                defocus_values=defocus_values[i],
-                Cs_vals=Cs_vals,
-                euler_angles=batch_euler_angles,
+                defocus_values=defocus_values_gpu,  # Use GPU tensor
+                Cs_vals=Cs_vals_gpu,  # Use GPU tensor
+                euler_angles=batch_euler_angles,  # Already on GPU
                 micrograph_data=micrograph_data.iloc[i],
             )
             # Update best values where this batch has higher correlation
@@ -770,6 +843,12 @@ def run_tm_gpu_batch_1(input_yaml: str):
 
         torch.cuda.synchronize()    
 
+
+        end_mic_time = time.time()
+        if i == 0:
+            print(f"Time taken for micrograph {i}: {end_mic_time - start_mic_time:.2f} seconds")
+            num_proj = defocus_values.shape[0] * Cs_vals.shape[0] * num_angles
+            print(f"Time taken per 1000 projections: {(end_mic_time - start_mic_time) / num_proj * 1000:.2f} seconds")
         #Move everything back to cpu
         sum_correlation = sum_correlation.cpu()
         sum_correlation_squared = sum_correlation_squared.cpu()
@@ -801,6 +880,9 @@ def run_tm_gpu_batch_1(input_yaml: str):
             num_pixels=num_pixels,
             total_correlation_positions=total_correlation_positions,
         )
+
+
+
 
 def run_tm_gpu_batch_2(input_yaml: str):
     # 
@@ -919,8 +1001,13 @@ def run_tm_gpu_batch_2(input_yaml: str):
         #now batch the angles
         #batch_size = 10  # Can be tuned based on memory
 
-        device = torch.device('cuda')
+        device = get_gpu_with_most_memory()
         # = torch.device('cpu')
+
+        # Move input tensors to GPU
+        defocus_values_gpu = defocus_values[i].to(device)
+        Cs_vals_gpu = Cs_vals.to(device)
+        euler_angles_gpu = euler_angles.to(device)
 
         nAng_batch_size = calculate_batch_size(
             micrograph_shape=micrograph.shape[-2:],
@@ -961,6 +1048,9 @@ def run_tm_gpu_batch_2(input_yaml: str):
         maximum_intensiy_projection = torch.zeros(micrograph.shape[-2:], dtype=torch.float32, device=device)
 
         combined_template_filter = einops.rearrange(combined_template_filter, "nDefoc nCs h w -> nDefoc nCs 1 h w").to(device)
+        # Move dft_map to device
+        dft_map = dft_map.to(device)
+        mrc_map_shape = torch.tensor(mrc_map.shape, device=device)
         # Iterate over angle batches
         for batch_start in range(0, nAng, nAng_batch_size):
             batch_end = min(batch_start + nAng_batch_size, nAng)
@@ -979,7 +1069,7 @@ def run_tm_gpu_batch_2(input_yaml: str):
                         proj = extract_fourier_slice(
                             dft_volume=dft_map,
                             rotation_matrices=batch_matrices,
-                            volume_shape=mrc_map.shape,
+                            volume_shape=mrc_map_shape,
                         )
                         # Rearrange and multiply with template filter
                         proj = einops.rearrange(proj, "nAng h w -> 1 1 nAng h w")
@@ -1016,14 +1106,14 @@ def run_tm_gpu_batch_2(input_yaml: str):
                                     # ... existing processing code ...
 
                         # Use stream-specific tensors
-                        stream_tensors[stream_id]['sum_correlation'] += einops.reduce(proj, "1 1 nAng h w -> h w", "sum")
-                        stream_tensors[stream_id]['sum_correlation_squared'] += einops.reduce(proj**2, "1 1 nAng h w -> h w", "sum")
+                        stream_tensors[stream_id]['sum_correlation'] += einops.reduce(proj, "nDefoc nCs nAng h w -> h w", "sum")
+                        stream_tensors[stream_id]['sum_correlation_squared'] += einops.reduce(proj**2, "nDefoc nCs nAng h w -> h w", "sum")
 
                         #Get best and max
                         this_best_defoc, this_best_pixel_size, this_best_phi, this_best_theta, this_best_psi, this_maximum_intensity_projection = get_mip_and_best_single_mic(
                             projections=proj,
-                            defocus_values=defocus_values[i],
-                            Cs_vals=Cs_vals,
+                            defocus_values=defocus_values_gpu,
+                            Cs_vals=Cs_vals_gpu,
                             euler_angles=batch_euler_angles,
                             micrograph_data=micrograph_data.iloc[i],
                         )
@@ -1091,9 +1181,14 @@ def run_tm_gpu_batch_2(input_yaml: str):
 if __name__ == "__main__":
     import time
     start_time = time.time()
-    run_tm_cpu_batch("/Users/josh/git/teamtomo/tt2DTM/data/inputs_batch.yaml")
+    #run_tm_cpu_batch("/Users/josh/git/teamtomo/tt2DTM/data/inputs_batch.yaml")
+    run_tm_gpu_batch_1("/home/jdickerson/git/teamtomo/tt2DTM/data/inputs_batch.yaml")
     end_time = time.time()
-    print(f"Total runtime: {end_time - start_time:.2f} seconds")
+    print(f"Total runtime gpu attempt 1: {end_time - start_time:.2f} seconds")
+    #start_time = time.time()
+    #run_tm_gpu_batch_2("/home/jdickerson/git/teamtomo/tt2DTM/data/inputs_batch.yaml")
+    #end_time = time.time()
+    #print(f"Total runtime gpu attempt 2: {end_time - start_time:.2f} seconds")
     #run_tm("/Users/josh/git/teamtomo/tt2DTM/data/inputs.yaml")
     #run_tm("/Users/josh/git/teamtomo/tt2DTM/data/inputs.yaml")
 

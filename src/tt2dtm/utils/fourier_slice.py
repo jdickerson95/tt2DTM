@@ -41,8 +41,14 @@ def fft_volume(
 def extract_fourier_slice(
     dft_volume: torch.Tensor,
     rotation_matrices: torch.Tensor,
-    volume_shape: tuple[int, int, int],
+    volume_shape: torch.Tensor,
 ) -> torch.Tensor:
+
+    # print device of all three tensors
+    #print(f"dft_volume device: {dft_volume.device}")
+    #print(f"rotation_matrices device: {rotation_matrices.device}")
+    #print(f"volume_shape device: {volume_shape.device}")
+
     # make projections by taking central slices
     projections = extract_central_slices_rfft_3d(
         volume_rfft=dft_volume,

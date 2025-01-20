@@ -129,9 +129,9 @@ def get_mip_and_best_single_mic(
     cs_indices = (flat_indices // nAng) % nCs
     ang_indices = flat_indices % nAng
 
-    print("defoc indices", defoc_indices.shape)
-    print("cs indices", cs_indices.shape)
-    print("ang indices", ang_indices.shape)
+    #print("defoc indices", defoc_indices.shape)
+    #print("cs indices", cs_indices.shape)
+    #print("ang indices", ang_indices.shape)
     best_defoc = defocus_values[defoc_indices]
     best_cs = Cs_vals[cs_indices]
     best_angles = euler_angles[ang_indices]
