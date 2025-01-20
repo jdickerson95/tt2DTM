@@ -50,13 +50,13 @@ def calculate_batch_size(
     
     # Memory for one projection (accounting for all defocus and Cs values)
     # Shape will be (n_defoc, n_Cs, 1, h, w)
-    proj_size = defoc_vals.shape[0] * Cs_vals.shape[0] * h * w * bytes_per_complex64
+    proj_size = defoc_vals.shape[0] * Cs_vals.shape[0] * h * w * bytes_per_float32
     
     # Convert to GB
     proj_size_gb = proj_size / (1024**3)
 
-    #Needs to have double free for operations
-    proj_size_gb *= 2
+    #Needs to have memory free for operations on it
+    proj_size_gb *= 4.0
     
     # Calculate maximum batch size
     max_batch_size = int(available_memory_gb / proj_size_gb)

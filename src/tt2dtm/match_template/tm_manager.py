@@ -742,21 +742,21 @@ def run_tm_gpu_batch_1(input_yaml: str):
             proj = proj * combined_template_filter
 
             #print memoery size of proj
-            print(f"elem size {proj.element_size()}")
-            print(f"numel {proj.numel() / (micrograph.shape[-2] * micrograph.shape[-1])} ")
-            print("proj size", (proj.numel() * proj.element_size()) / 1024**3)
+            #print(f"elem size {proj.element_size()}")
+            #print(f"numel {proj.numel() / (micrograph.shape[-2] * micrograph.shape[-1])} ")
+            #print("proj size", (proj.numel() * proj.element_size()) / 1024**3)
             #print proj data type
-            print("proj data type", proj.dtype)
-            print(f"proj shape {proj.shape}")
+            #print("proj data type", proj.dtype)
+            #print(f"proj shape {proj.shape}")
                 
             # Backwards FFT
             proj = torch.fft.irfftn(proj, dim=(-2, -1))
 
             #print memoery size of proj
-            print("proj size", (proj.numel() * proj.element_size()) / 1024**3)
+            #print("proj size", (proj.numel() * proj.element_size()) / 1024**3)
             #print proj data type
-            print("proj data type", proj.dtype)
-            print(f"proj shape {proj.shape}")
+            #print("proj data type", proj.dtype)
+            #print(f"proj shape {proj.shape}")
 
             # Flip contrast
             proj = proj * -1
@@ -778,10 +778,10 @@ def run_tm_gpu_batch_1(input_yaml: str):
             )
 
             #print memoery size of proj
-            print("proj size", (proj.numel() * proj.element_size()) / 1024**3)
+            #print("proj size", (proj.numel() * proj.element_size()) / 1024**3)
             #print proj data type
-            print("proj data type", proj.dtype)
-            print(f"proj shape {proj.shape}")
+            #print("proj data type", proj.dtype)
+            #print(f"proj shape {proj.shape}")
                 
             # Cross correlation
             '''
@@ -792,13 +792,32 @@ def run_tm_gpu_batch_1(input_yaml: str):
             )
             '''
 
+
+            def print_memory_usage(step):
+                #torch.cuda.synchronize(device)  # Ensure all operations are complete on the specified device
+                print(f"{step}: Allocated: {torch.cuda.memory_allocated(device) / (1024**3):.2f} GB, Reserved: {torch.cuda.memory_reserved(device) / (1024**3):.2f} GB")
+
+
+            
             #Do this here instead have having in place operation memory issues
+
+            #print_memory_usage("Before fftshift")
             proj = torch.fft.fftshift(proj, dim=(-2, -1))
+            #print_memory_usage("After fftshift")
             proj = torch.fft.rfftn(proj, dim=(-2, -1))
+            #print_memory_usage("After rfftn")
             proj[:, 0, 0] = 0 + 0j
+            #print_memory_usage("After zeroing central pixel")
             proj = proj.conj()
+            #print_memory_usage("After conj")
             proj = proj * dft_micrograph
+            #print_memory_usage("After multiplying by dft_micrograph")
             proj = torch.fft.irfftn(proj, dim=(-2, -1))
+            #print_memory_usage("After irfftn")
+
+            
+
+
 
 
 
@@ -815,12 +834,12 @@ def run_tm_gpu_batch_1(input_yaml: str):
 
 
             #print memoery size of proj
-            print("proj size", (proj.numel() * proj.element_size()) / 1024**3)
+            #print("proj size", (proj.numel() * proj.element_size()) / 1024**3)
             #print proj data type
-            print("proj data type", proj.dtype)
-            print(f"proj shape {proj.shape}")
+            #print("proj data type", proj.dtype)
+            #print(f"proj shape {proj.shape}")
 
-            print(f"mean proj = {proj.mean()}")
+            #print(f"mean proj = {proj.mean()}")
             #Need to process each batch to get best and max, update sum corr and histogram
             sum_correlation = sum_correlation + einops.reduce(proj, "nDefoc nCs nAng h w -> h w", "sum")
             sum_correlation_squared = sum_correlation_squared + einops.reduce(proj ** 2, "nDefoc nCs nAng h w -> h w", "sum")
@@ -845,10 +864,9 @@ def run_tm_gpu_batch_1(input_yaml: str):
 
 
         end_mic_time = time.time()
-        if i == 0:
-            print(f"Time taken for micrograph {i}: {end_mic_time - start_mic_time:.2f} seconds")
-            num_proj = defocus_values.shape[0] * Cs_vals.shape[0] * num_angles
-            print(f"Time taken per 1000 projections: {(end_mic_time - start_mic_time) / num_proj * 1000:.2f} seconds")
+        print(f"Time taken for micrograph {i}: {end_mic_time - start_mic_time:.2f} seconds")
+        num_proj = defocus_values.shape[0] * Cs_vals.shape[0] * num_angles
+        print(f"Time taken per 1000 projections: {(end_mic_time - start_mic_time) / num_proj * 1000:.2f} seconds")
         #Move everything back to cpu
         sum_correlation = sum_correlation.cpu()
         sum_correlation_squared = sum_correlation_squared.cpu()
