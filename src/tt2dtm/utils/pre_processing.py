@@ -3,6 +3,7 @@
 import torch
 from torch_fourier_filter.ctf import calculate_ctf_2d
 from torch_fourier_filter.whitening import whitening_filter
+from torch_fourier_filter.bandpass import bandpass_filter
 from torch_so3.hopf_angles import get_uniform_euler_angles
 
 
@@ -37,6 +38,9 @@ def calculate_whitening_filter_template(
         output_shape=output_shape,
         output_rfft=True,
         output_fftshift=False,
+        smooth_filter=smoothing,
+        smooth_kernel_size=1001,
+        smooth_sigma=100.0,
     )
 
 
@@ -142,6 +146,13 @@ def do_image_preprocessing(image: torch.Tensor) -> torch.Tensor:
         The pre-processed image.
 
     """
+
+    #####Replace values outside 5 sigma with the mean####
+    mean = image.mean()
+    std = image.std()
+    image[image > mean + 5 * std] = mean
+    image[image < mean - 5 * std] = mean
+
     image_dft = torch.fft.rfftn(image)
     image_dft[0, 0] = 0 + 0j
 
@@ -149,8 +160,23 @@ def do_image_preprocessing(image: torch.Tensor) -> torch.Tensor:
         image_dft=image_dft,
         rfft=True,
         fftshift=False,
+        dim=(-2, -1),
         do_power_spectrum=True,
+        smooth_filter=False,
+        smooth_kernel_size=1001,
+        smooth_sigma=100.0,
     )
+    bandpass_filter_image = calculate_bandpass_filter(
+        low_pass_cutoff=0.00,
+        high_pass_cutoff=0.32,
+        falloff=0.05,
+        image_shape=image.shape[-2:],
+        rfft=True,
+        fftshift=False,
+        device=image.device
+    )
+    wf_image *= bandpass_filter_image
+
     image_dft *= wf_image
     image_dft[0, 0] = 0 + 0j  # superfluous, but following cisTEM
 
@@ -164,6 +190,25 @@ def do_image_preprocessing(image: torch.Tensor) -> torch.Tensor:
     # image_dft *= image.numel()  # Scale to variance 1 in real-space
 
     return image_dft
+
+def calculate_bandpass_filter(
+    low_pass_cutoff: float,
+    high_pass_cutoff: float,
+    falloff: float = 0.05,
+    image_shape: tuple[int, int] = (512, 512),
+    rfft: bool = True,
+    fftshift: bool = False,
+    device: torch.device = None
+) -> torch.Tensor:
+    return bandpass_filter(
+        low=low_pass_cutoff,
+        high=high_pass_cutoff,
+        falloff=falloff,
+        image_shape=image_shape,
+        rfft=rfft,
+        fftshift=fftshift,
+        device=device,
+    )
 
 
 def calculate_searched_orientations(

@@ -11,6 +11,13 @@ from torch_fourier_slice import extract_central_slices_rfft_3d
 COMPILE_BACKEND = "inductor"
 DEFAULT_STATISTIC_DTYPE = torch.float32
 
+# Constants
+CCG_NOISE_STDEV = 1.0
+HISTOGRAM_NUM_POINTS = 512
+HISTOGRAM_MIN = -12.5
+HISTOGRAM_MAX = 22.5
+HISTOGRAM_STEP = (HISTOGRAM_MAX - HISTOGRAM_MIN) / HISTOGRAM_NUM_POINTS
+
 # Turn off gradient calculations by default
 torch.set_grad_enabled(False)
 
@@ -207,13 +214,15 @@ def scale_mip(
         Tuple containing the MIP and scaled MIP
     """
     num_pixels = torch.tensor(mip.shape[0] * mip.shape[1])
-
+    #mip = mip * (num_pixels**0.5)
     # Convert sum and squared sum to mean and variance in-place
     correlation_sum = correlation_sum / total_correlation_positions
     correlation_squared_sum = correlation_squared_sum / total_correlation_positions
     correlation_squared_sum -= correlation_sum**2
-    correlation_squared_sum = torch.sqrt(torch.clamp(correlation_squared_sum, min=0))
+    correlation_squared_sum = torch.sqrt(torch.clamp(correlation_squared_sum, min=0)) * (num_pixels**0.5)
 
+    correlation_sum *= (num_pixels**0.5)
+    mip *= (num_pixels**0.5)
     # Calculate normalized MIP
     mip_scaled = mip - correlation_sum
     torch.where(
@@ -223,10 +232,107 @@ def scale_mip(
         out=mip_scaled,
     )
 
-    mip = mip * (num_pixels**0.5)
+
 
     return mip, mip_scaled
 
+def get_expected_noise(
+    num_pixels: torch.Tensor,
+    total_correlation_positions: torch.Tensor,
+):
+    """Get the expected noise.
+
+    Parameters
+    ----------
+    num_pixels : torch.Tensor
+        The number of pixels.
+    total_correlation_positions : torch.Tensor
+        The total correlation positions.
+    """
+    #Get the expected noise
+    erf_input = torch.tensor(2.0, dtype=torch.float64) / (torch.tensor(1.0, dtype=torch.float64) * num_pixels.to(torch.float64) * total_correlation_positions)
+    #erfc_input = torch.tensor(1.0, dtype=torch.float64) - erf_input
+    inverse_c_erf = torch.erfinv(torch.tensor(1.0, dtype=torch.float64) - erf_input)  
+    expected_noise = (2**0.5) * CCG_NOISE_STDEV * inverse_c_erf
+
+    return expected_noise
+
+def calc_survival_histogram_single(
+    projections: torch.Tensor,
+    num_pixels: torch.Tensor,
+    total_correlation_positions: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, float, torch.Tensor]:
+    """
+    Calculate the survival histogram.
+
+    Parameters
+    ----------
+    projections : torch.Tensor
+        The projections to calculate the survival histogram from.
+    num_pixels : torch.Tensor
+        The number of pixels.
+    total_correlation_positions : torch.Tensor
+        The total correlation positions.
+
+    Returns
+    -------
+    survival_histogram : torch.Tensor
+        The survival histogram.
+    expected_survival_hist : torch.Tensor
+        The expected survival histogram.
+    temp_float : float
+        The temp float.
+    histogram_data : torch.Tensor
+        The histogram data.
+    """
+    #histogram_min_scaled = HISTOGRAM_MIN / num_pixels**0.5
+    #histogram_step_scaled = HISTOGRAM_STEP / num_pixels**0.5
+    histogram_min_scaled = HISTOGRAM_MIN
+    histogram_step_scaled = HISTOGRAM_STEP
+    # Create histogram for each micrograph
+    histogram_data = torch.zeros((HISTOGRAM_NUM_POINTS), device=projections.device)
+    
+    # Calculate bins using torch operations
+    bins = ((projections - histogram_min_scaled) / histogram_step_scaled).long()
+
+    # Create a mask for valid bins (between 0 and histogram_number_of_points)
+    valid_mask = (bins >= 0) & (bins < HISTOGRAM_NUM_POINTS)
+        
+    # Use torch.bincount to count occurrences of each bin
+    # Only count values where the mask is True
+    valid_bins = bins[valid_mask]
+    histogram_data = torch.bincount(
+        valid_bins, 
+        minlength=HISTOGRAM_NUM_POINTS
+    )
+    
+    temp_float = HISTOGRAM_MIN + (HISTOGRAM_STEP /2.0) # start pos
+    num_points = torch.arange(0, HISTOGRAM_NUM_POINTS)
+    expected_survival_hist = (torch.erfc((temp_float + HISTOGRAM_STEP *num_points) / 2.0**0.5)/2.0) * (num_pixels * total_correlation_positions)
+    # Calculate survival histogram (cumulative sum from right to left)
+    survival_histogram = torch.flip(torch.cumsum(torch.flip(histogram_data, [0]), dim=0), [0])
+
+    return survival_histogram, expected_survival_hist, temp_float, histogram_data
+
+
+def write_survival_histogram_single(
+    survival_histogram: torch.Tensor,
+    micrograph_number: int,
+    expected_noise: float,
+    histogram_data: torch.Tensor,
+    expected_survival_hist: torch.Tensor,
+    temp_float: float,
+    HISTOGRAM_STEP: float,
+    HISTOGRAM_NUM_POINTS: int,
+) -> None:
+    output_dir = "."
+    """Write survival histogram to file."""
+    print("Writing survival histogram")
+    with open(f"{output_dir}/survival_histogram_micrograph_{micrograph_number}.txt", "w") as f:
+        f.write(f"Expected threshold is {expected_noise}\n")
+        f.write(f"SNR, histogram, survival histogram, random survival histogram\n")
+        for i in range(HISTOGRAM_NUM_POINTS):
+            f.write(f"{temp_float + HISTOGRAM_STEP *i}, {histogram_data[i]}, {survival_histogram[i]}, {expected_survival_hist[i]}\n")
 
 ###########################################################################
 ### Helper functions called during the loop (passed into torch.compile) ###
@@ -276,6 +382,9 @@ def normalize_template_projection(
     edge_mean = edge_pixels.mean(dim=-1)
     projections -= edge_mean[..., None, None]
 
+    projections -= projections.mean(dim=(-1, -2), keepdim=True)
+    projections *= -1
+
     # # Calculate variance like cisTEM (does not match desired results...)
     # variance = (projections**2).sum(dim=(-1, -2), keepdim=True) * relative_size - (
     #     projections.mean(dim=(-1, -2), keepdim=True) * relative_size
@@ -288,7 +397,7 @@ def normalize_template_projection(
     variance *= relative_size
     variance += (1 / npix_padded) * mean**2
 
-    return projections / torch.sqrt(variance)
+    return projections / (torch.sqrt(variance))
 
 
 def do_iteration_statistics_updates(
@@ -304,6 +413,7 @@ def do_iteration_statistics_updates(
     correlation_squared_sum: torch.Tensor,
     H: int,
     W: int,
+    num_pixels: torch.Tensor,
 ) -> None:
     """Helper function for updating maxima and tracked statistics.
 
@@ -342,7 +452,12 @@ def do_iteration_statistics_updates(
         Height of the cross-correlation values.
     W : int
         Width of the cross-correlation values.
+    num_pixels : torch.Tensor
+        Number of pixels in the cross-correlation values.
     """
+
+    #cross_correlation = cross_correlation * (num_pixels**0.5)
+
     max_values, max_indices = torch.max(cross_correlation.view(-1, H, W), dim=0)
     max_defocus_idx = max_indices // euler_angles.shape[0]
     max_orientation_idx = max_indices % euler_angles.shape[0]
@@ -513,6 +628,35 @@ def core_match_template(
         total_correlation_positions=total_projections,
     )
 
+        # Calculate the survival histogram
+    #Get the expected noise
+    H, W = image_dft.shape
+    # account for RFFT
+    W = 2 * (W - 1)
+    num_pixels = torch.tensor(H * W)
+    total_correlation_positions = torch.tensor(euler_angles.shape[0] * defocus_values.shape[0])
+    expected_noise = get_expected_noise(
+        num_pixels=num_pixels,
+        total_correlation_positions=total_correlation_positions,
+    )
+    survival_histogram, expected_survival_hist, temp_float, histogram_data = calc_survival_histogram_single(
+        projections=mip_scaled,
+        num_pixels=num_pixels,
+        total_correlation_positions=total_correlation_positions,
+    )
+
+        
+    write_survival_histogram_single(
+        survival_histogram=survival_histogram,
+        micrograph_number=0,
+        expected_noise=expected_noise,
+        histogram_data=histogram_data,
+        expected_survival_hist=expected_survival_hist,
+        temp_float=temp_float,
+        HISTOGRAM_STEP=HISTOGRAM_STEP,
+        HISTOGRAM_NUM_POINTS=HISTOGRAM_NUM_POINTS,
+    )
+
     return {
         "mip": mip,
         "scaled_mip": mip_scaled,
@@ -583,6 +727,7 @@ def _core_match_template_single_gpu(
     # account for RFFT
     W = 2 * (W - 1)
     w = 2 * (w - 1)
+    num_pixels = torch.tensor(H * W)
 
     ################################################
     ### Initialize the tracked output statistics ###
@@ -649,8 +794,12 @@ def _core_match_template_single_gpu(
         euler_angles_batch = euler_angles[
             i * projection_batch_size : (i + 1) * projection_batch_size
         ]
+        #rot_matrix = roma.euler_to_rotmat(
+        #    "zyz", euler_angles_batch, degrees=True, device=device
+        #)
+
         rot_matrix = roma.euler_to_rotmat(
-            "zyz", euler_angles_batch, degrees=True, device=device
+            "ZYZ", euler_angles_batch, degrees=True, device=device
         )
 
         # Extract central slice(s) from the template volume
@@ -661,7 +810,7 @@ def _core_match_template_single_gpu(
         )
         fourier_slice = torch.fft.ifftshift(fourier_slice, dim=(-2,))
         fourier_slice[..., 0, 0] = 0 + 0j  # zero out the DC component (mean zero)
-        fourier_slice *= -1  # flip contrast
+        #fourier_slice *= -1  # flip contrast
 
         # Apply the projective filters on a new batch dimension
         fourier_slice = fourier_slice[None, ...] * projective_filters[:, None, ...]
@@ -674,12 +823,18 @@ def _core_match_template_single_gpu(
         # Inverse Fourier transform into real space and normalize
         projections = torch.fft.irfftn(fourier_slice, dim=(-2, -1))
         projections = torch.fft.ifftshift(projections, dim=(-2, -1))
+
+        #####Unpad the projections#####
+        #pad_length = h // 2
+        #projections = projections[..., pad_length:-pad_length, pad_length:-pad_length]
+
         projections = normalize_template_projection_compiled(
             projections, (h, w), (H, W)
         )
 
         # Padded forward Fourier transform for cross-correlation
         projections_dft = torch.fft.rfftn(projections, dim=(-2, -1), s=(H, W))
+        projections_dft[..., 0, 0] = 0 + 0j
 
         ### Cross correlation step by element-wise multiplication ###
         projections_dft = image_dft[None, None, ...] * projections_dft.conj()
@@ -699,6 +854,7 @@ def _core_match_template_single_gpu(
             correlation_squared_sum,
             H,
             W,
+            num_pixels,
         )
 
     # NOTE: Need to send all tensors back to the CPU as numpy arrays for the shared

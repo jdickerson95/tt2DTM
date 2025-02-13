@@ -4,6 +4,8 @@ import os
 from typing import Any, ClassVar
 
 import torch
+import torch.nn.functional as F
+from torch_grid_utils import fftfreq_grid
 from pydantic import ConfigDict, field_validator
 
 from tt2dtm.backend import core_match_template
@@ -21,6 +23,7 @@ from tt2dtm.utils.pre_processing import (
     calculate_searched_orientations,
     calculate_whitening_filter_template,
     do_image_preprocessing,
+    calculate_bandpass_filter,
 )
 
 
@@ -94,6 +97,7 @@ class MatchTemplateManager(BaseModel2DTM):
     match_template_result: MatchTemplateResult
     computational_config: ComputationalConfig
 
+
     # Non-serialized large array-like attributes
     micrograph: ExcludedTensor
     template_volume: ExcludedTensor
@@ -133,9 +137,34 @@ class MatchTemplateManager(BaseModel2DTM):
         """Generates the keyword arguments for backend call from held parameters."""
         image = torch.from_numpy(self.micrograph)
         template = torch.from_numpy(self.template_volume)
+
+        #####Pad the template#####
+        pad_length = template.shape[-1] // 2
+        template = F.pad(template, pad=[pad_length] * 6, mode='constant', value=0)
+
+        # premultiply by sinc2
+        grid = fftfreq_grid(
+            image_shape=template.shape,
+            rfft=False,
+            fftshift=True,
+            norm=True,
+            device=template.device
+        )
+        #template = template * torch.sinc(grid) ** 2
+
         template_shape = template.shape[-2:]
 
-        whitening_filter = calculate_whitening_filter_template(image, template_shape)
+        whitening_filter = calculate_whitening_filter_template(image, template_shape, smoothing=False)
+        bandpass_filter_template = calculate_bandpass_filter(
+            low_pass_cutoff=0.00,
+            high_pass_cutoff=0.32,
+            falloff=0.05,
+            image_shape=template_shape,
+            rfft=True,
+            fftshift=False,
+            device=template.device
+        )
+        whitening_filter *= bandpass_filter_template
         image_preprocessed_dft = do_image_preprocessing(image)
 
         defocus_values = self.defocus_search_config.defocus_values
