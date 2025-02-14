@@ -1,9 +1,9 @@
 """Helper functions for pre-processing data for 2DTM."""
 
 import torch
+from torch_fourier_filter.bandpass import bandpass_filter
 from torch_fourier_filter.ctf import calculate_ctf_2d
 from torch_fourier_filter.whitening import whitening_filter
-from torch_fourier_filter.bandpass import bandpass_filter
 from torch_so3.hopf_angles import get_uniform_euler_angles
 
 
@@ -146,7 +146,6 @@ def do_image_preprocessing(image: torch.Tensor) -> torch.Tensor:
         The pre-processed image.
 
     """
-
     #####Replace values outside 5 sigma with the mean####
     mean = image.mean()
     std = image.std()
@@ -168,12 +167,12 @@ def do_image_preprocessing(image: torch.Tensor) -> torch.Tensor:
     )
     bandpass_filter_image = calculate_bandpass_filter(
         low_pass_cutoff=0.00,
-        high_pass_cutoff=0.32,
-        falloff=0.05,
+        high_pass_cutoff=0.5,
+        falloff=0.02,
         image_shape=image.shape[-2:],
         rfft=True,
         fftshift=False,
-        device=image.device
+        device=image.device,
     )
     wf_image *= bandpass_filter_image
 
@@ -191,6 +190,7 @@ def do_image_preprocessing(image: torch.Tensor) -> torch.Tensor:
 
     return image_dft
 
+
 def calculate_bandpass_filter(
     low_pass_cutoff: float,
     high_pass_cutoff: float,
@@ -198,7 +198,7 @@ def calculate_bandpass_filter(
     image_shape: tuple[int, int] = (512, 512),
     rfft: bool = True,
     fftshift: bool = False,
-    device: torch.device = None
+    device: torch.device = None,
 ) -> torch.Tensor:
     return bandpass_filter(
         low=low_pass_cutoff,

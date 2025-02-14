@@ -6,7 +6,8 @@ import numpy as np
 import roma
 import torch
 import tqdm
-from torch_fourier_slice import extract_central_slices_rfft_3d
+from ttsim3d.models import Simulator2D, SimulatorConfig
+from ttsim3d.simulate2d import simulate2d
 
 COMPILE_BACKEND = "inductor"
 DEFAULT_STATISTIC_DTYPE = torch.float32
@@ -27,7 +28,7 @@ set_start_method("spawn", force=True)
 
 def construct_multi_gpu_match_template_kwargs(
     image_dft: torch.Tensor,
-    template_dft: torch.Tensor,
+    template_dft_shape: tuple[int, int],
     euler_angles: torch.Tensor,
     projective_filters: torch.Tensor,
     defocus_values: torch.Tensor,
@@ -43,8 +44,8 @@ def construct_multi_gpu_match_template_kwargs(
     ----------
     image_dft : torch.Tensor
         dft of image
-    template_dft : torch.Tensor
-        dft of template
+    template_dft_shape : tuple[int, int]
+        Shape of the template dft. Has shape (h, w).
     euler_angles : torch.Tensor
         euler angles to search
     projective_filters : torch.Tensor
@@ -72,7 +73,7 @@ def construct_multi_gpu_match_template_kwargs(
     for device, euler_angles_device in zip(devices, euler_angles_split):
         # Allocate all tensors to the device
         image_dft_device = image_dft.to(device)
-        template_dft_device = template_dft.to(device)
+        template_dft_shape_device = template_dft_shape.to(device)
         euler_angles_device = euler_angles_device.to(device)
         projective_filters_device = projective_filters.to(device)
         defocus_values_device = defocus_values.to(device)
@@ -80,7 +81,7 @@ def construct_multi_gpu_match_template_kwargs(
         # Construct the kwargs dictionary
         kwargs = {
             "image_dft": image_dft_device,
-            "template_dft": template_dft_device,
+            "template_dft_shape": template_dft_shape_device,
             "euler_angles": euler_angles_device,
             "projective_filters": projective_filters_device,
             "defocus_values": defocus_values_device,
@@ -512,9 +513,9 @@ do_iteration_statistics_updates_compiled = torch.compile(
 ###########################################################
 
 
-def core_match_template(
+def core_match_template_project(
     image_dft: torch.Tensor,
-    template_dft: torch.Tensor,  # already fftshifted
+    template_dft_shape: tuple[int, int],
     ctf_filters: torch.Tensor,
     whitening_filter_template: torch.Tensor,
     defocus_values: torch.Tensor,
@@ -533,10 +534,8 @@ def core_match_template(
     image_dft : torch.Tensor
         Real-fourier transform (RFFT) of the image with large image filters
         already applied. Has shape (H, W // 2 + 1).
-    template_dft : torch.Tensor
-        Real-fourier transform (RFFT) of the template volume to take Fourier
-        slices from. Has shape (l, h, w // 2 + 1). where l is the number of
-        slices.
+    template_dft_shape : tuple[int, int]
+        Shape of the template dft. Has shape (h, w).
     ctf_filters : torch.Tensor
         Stack of CTF filters at different defocus values to use in the search.
         Has shape (defocus_batch, h, w // 2 + 1).
@@ -544,7 +543,7 @@ def core_match_template(
         Whitening filter for the template volume. Has shape (h, w // 2 + 1).
         Gets multiplied with the ctf filters to create a filter stack.
     euler_angles : torch.Tensor
-        Euler angles (in 'zyz' convention) to search over. Has shape
+        Euler angles (in 'ZYZ' convention) to search over. Has shape
         (orientations, 3).
     defocus_values : torch.Tensor
         What defoucs values correspond with the CTF filters. Has shape
@@ -587,7 +586,7 @@ def core_match_template(
 
     kwargs_per_device = construct_multi_gpu_match_template_kwargs(
         image_dft=image_dft,
-        template_dft=template_dft,
+        template_dft_shape=template_dft_shape,
         euler_angles=euler_angles,
         projective_filters=projective_filters,
         defocus_values=defocus_values,
@@ -690,7 +689,7 @@ def _core_match_template_single_gpu(
     result_dict: dict,
     device_id: int,
     image_dft: torch.Tensor,
-    template_dft: torch.Tensor,
+    template_dft_shape: tuple[int, int],
     euler_angles: torch.Tensor,
     projective_filters: torch.Tensor,
     defocus_values: torch.Tensor,
@@ -714,10 +713,8 @@ def _core_match_template_single_gpu(
     image_dft : torch.Tensor
         Real-fourier transform (RFFT) of the image with large image filters
         already applied. Has shape (H, W // 2 + 1).
-    template_dft : torch.Tensor
-        Real-fourier transform (RFFT) of the template volume to take Fourier
-        slices from. Has shape (l, h, w // 2 + 1). where l is the number of
-        slices.
+    template_dft_shape : tuple[int, int]
+        Shape of the template dft. Has shape (h, w).
     euler_angles : torch.Tensor
         Euler angles (in 'zyz' convention) to search over. Has shape
         (orientations // n_devices, 3). This has already been split (e.g.
@@ -737,7 +734,7 @@ def _core_match_template_single_gpu(
     """
     device = image_dft.device
     H, W = image_dft.shape
-    h, w = template_dft.shape[-2:]
+    h, w = template_dft_shape
     # account for RFFT
     W = 2 * (W - 1)
     w = 2 * (w - 1)
@@ -799,6 +796,29 @@ def _core_match_template_single_gpu(
     total_projections = euler_angles.shape[0] * defocus_values.shape[0]
 
     ##################################
+    ### Set up 2D projection class ###
+    ##################################
+    sim_conf = SimulatorConfig(
+        voltage=300.0,  # in keV
+        apply_dose_weighting=True,
+        dose_start=0.0,  # in e-/A^2
+        dose_end=50.0,  # in e-/A^2
+        upsampling=-1,  # auto
+    )
+
+    # Instantiate the simulator
+    sim = Simulator2D(
+        pdb_filepath="data/parsed_6Q8Y_whole_LSU_match3.pdb",
+        pixel_spacing=0.95,  # Angstroms
+        image_shape=(h, w),
+        b_factor_scaling=0.5,
+        additional_b_factor=0.0,  # Add to all atoms
+        simulator_config=sim_conf,
+    )
+
+    atom_b_factors = sim.get_scale_atom_b_factors()
+    mtf_frequencies, mtf_amplitudes = sim.simulator_config.mtf_tensors
+    ##################################
     ### Start the orientation loop ###
     ##################################
 
@@ -806,39 +826,42 @@ def _core_match_template_single_gpu(
         euler_angles_batch = euler_angles[
             i * projection_batch_size : (i + 1) * projection_batch_size
         ]
-        # rot_matrix = roma.euler_to_rotmat(
-        #    "zyz", euler_angles_batch, degrees=True, device=device
-        # )
 
         rot_matrix = roma.euler_to_rotmat(
             "ZYZ", euler_angles_batch, degrees=True, device=device
         )
 
-        # Extract central slice(s) from the template volume
-        fourier_slice = extract_central_slices_rfft_3d(
-            volume_rfft=template_dft,
-            image_shape=(h,) * 3,  # NOTE: requires cubic template
-            rotation_matrices=rot_matrix,
+        # Multiply the rot_matrix by the template_atom_positions_zyx
+        template_atom_positions_zyx = sim.atom_positions_zyx * rot_matrix
+        template_atom_positions_yx = template_atom_positions_zyx[:, 1:]
+
+        real_space_template = simulate2d(
+            atom_positions_yx=template_atom_positions_yx,
+            atom_ids=sim.atom_identities,
+            atom_b_factors=atom_b_factors,
+            beam_energy_kev=sim.simulator_config.voltage,
+            sim_pixel_spacing=sim.pixel_spacing,
+            sim_image_shape=(h, w),
+            requested_upsampling=sim.simulator_config.upsampling,
+            apply_dose_weighting=sim.simulator_config.apply_dose_weighting,
+            dose_start=sim.simulator_config.dose_start,
+            dose_end=sim.simulator_config.dose_end,
+            dose_filter_modify_signal=sim.simulator_config.dose_filter_modify_signal,  # type: ignore
+            dose_filter_critical_bfactor=sim.simulator_config.crit_exposure_bfactor,
+            apply_dqe=sim.simulator_config.apply_dqe,
+            mtf_frequencies=mtf_frequencies,
+            mtf_amplitudes=mtf_amplitudes,
         )
-        fourier_slice = torch.fft.ifftshift(fourier_slice, dim=(-2,))
+
+        fourier_slice = torch.fft.rfftn(real_space_template, dim=(-2, -1), s=(h, w))
         fourier_slice[..., 0, 0] = 0 + 0j  # zero out the DC component (mean zero)
         # fourier_slice *= -1  # flip contrast
 
         # Apply the projective filters on a new batch dimension
         fourier_slice = fourier_slice[None, ...] * projective_filters[:, None, ...]
 
-        # NOTE: This is reshaping into a single batch dimension (not used)
-        # fourier_slice = fourier_slice.reshape(
-        #     -1, fourier_slice.shape[-2], fourier_slice.shape[-1]
-        # )
-
         # Inverse Fourier transform into real space and normalize
         projections = torch.fft.irfftn(fourier_slice, dim=(-2, -1))
-        projections = torch.fft.ifftshift(projections, dim=(-2, -1))
-
-        #####Unpad the projections#####
-        # pad_length = h // 2
-        # projections = projections[..., pad_length:-pad_length, pad_length:-pad_length]
 
         projections = normalize_template_projection_compiled(
             projections, (h, w), (H, W)
