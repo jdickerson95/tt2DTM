@@ -68,13 +68,53 @@ class OrientationSearchConfig(BaseModel2DTM):
 
         return value
 
-        # @field_validator("template_symmetry")
-        # def validate_template_symmetry(cls, value):  # type: ignore
-        #     """Validate from allowed symmetry groups."""
-        #     if value not in ALLOWED_SYMMETRY_GROUPS:
-        #         raise ValueError(
-        #             f"Currently only supports the following symmetry "
-        #             f"group(s):\n\t {ALLOWED_SYMMETRY_GROUPS}"
-        #         )
+
+class RefineOrientationConfig(BaseModel2DTM):
+    """Serialization and validation of orientation refinement parameters.
+
+    Angles will be sampled from [-coarse_step, coarse_step] in increments of
+    'fine_step' for the orientation refinement search.
+
+    Attributes
+    ----------
+    orientation_sampling_method : str
+        Method for sampling orientations. Default is 'Hopf Fibration'.
+        Currently only 'Hopf Fibration' is supported.
+    template_symmetry : str
+        Symmetry group of the template. Default is 'C1'.
+        Currently only 'C1' is supported.
+    in_plane_angular_step_coarse : float
+        Angular step size for in-plane rotations in degrees for previous, coarse search.
+        This corresponds to the 'OrientationSearchConfig.in_plane_angular_step' value
+        for the match template program. Must be greater than or equal to 0.
+    in_plane_angular_step_fine : float
+        Angular step size for in-plane rotations in degrees for current, fine search.
+        Must be greater than or equal to 0.
+    out_of_plane_angular_step_coarse : float
+        Angular step size for out-of-plane rotations in degrees for previous, coarse
+        search. This corresponds to the
+        'OrientationSearchConfig.out_of_plane_angular_step' value for the match template
+        program. Must be greater than or equal to 0.
+    out_of_plane_angular_step_fine : float
+        Angular step size for out-of-plane rotations in degrees for current, fine
+        search. Must be greater than or equal to 0.
+
+    """
+
+    orientation_sampling_method: str = "Hopf Fibration"
+    template_symmetry: str = "C1"
+    in_plane_angular_step_coarse: Annotated[float, Field(..., ge=0.0)] = 1.5
+    in_plane_angular_step_fine: Annotated[float, Field(..., ge=0.0)] = 0.1
+    out_of_plane_angular_step_coarse: Annotated[float, Field(..., ge=0.0)] = 2.5
+    out_of_plane_angular_step_fine: Annotated[float, Field(..., ge=0.0)] = 0.1
+
+    @field_validator("orientation_sampling_method")
+    def validate_orientation_sampling_method(cls, value):  # type: ignore
+        """Validate from allowed orientation sampling methods."""
+        if value not in ALLOWED_ORIENTATION_SAMPLING_METHODS:
+            raise ValueError(
+                f"Currently only supports the following sampling "
+                f"method(s):\n\t {ALLOWED_ORIENTATION_SAMPLING_METHODS}"
+            )
 
         return value
