@@ -11,10 +11,10 @@ from pydantic import ConfigDict, field_validator
 from tt2dtm.backend import core_match_template
 from tt2dtm.pydantic_models.computational_config import ComputationalConfig
 from tt2dtm.pydantic_models.correlation_filters import PreprocessingFilters
-from tt2dtm.pydantic_models.defocus_search_config import DefocusSearchConfig
+from tt2dtm.pydantic_models.defocus_search import DefocusSearchConfig
 from tt2dtm.pydantic_models.match_template_result import MatchTemplateResult
 from tt2dtm.pydantic_models.optics_group import OpticsGroup
-from tt2dtm.pydantic_models.orientation_search_config import OrientationSearchConfig
+from tt2dtm.pydantic_models.orientation_search import OrientationSearchConfig
 from tt2dtm.pydantic_models.pixel_size_search_config import PixelSizeSearchConfig
 from tt2dtm.pydantic_models.types import BaseModel2DTM, ExcludedTensor
 from tt2dtm.utils.data_io import load_mrc_image, load_mrc_volume
@@ -120,12 +120,13 @@ class MatchTemplateManager(BaseModel2DTM):
 
         return str(v)
 
-    def __init__(self, **data: Any):
+    def __init__(self, skip_mrc_preloads: bool = False, **data: Any):
         super().__init__(**data)
 
         # Load the data from the MRC files
-        self.micrograph = load_mrc_image(self.micrograph_path)
-        self.template_volume = load_mrc_volume(self.template_volume_path)
+        if not skip_mrc_preloads:
+            self.micrograph = load_mrc_image(self.micrograph_path)
+            self.template_volume = load_mrc_volume(self.template_volume_path)
 
     ############################################
     ### Functional (data processing) methods ###
