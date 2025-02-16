@@ -119,11 +119,6 @@ def calculate_ctf_filter_stack(
 def do_image_preprocessing(image: torch.Tensor) -> torch.Tensor:
     """Pre-processes the input image before running the algorithm.
 
-    NOTE: Although we want an image with mean zero and variance 1, we do not divide by
-    the number of pixels because the CCG normalization requires that the CCG be divided
-    by the number of elements. This operation is skipped to save computation time during
-    the search.
-
     1. RFFT
     2. Calculate whitening filter
     2. Zero central pixel
@@ -160,8 +155,7 @@ def do_image_preprocessing(image: torch.Tensor) -> torch.Tensor:
     squared_sum = squared_image_dft.sum() + squared_image_dft[:, 1:].sum()
     image_dft /= torch.sqrt(squared_sum)
 
-    # NOTE: skip this operation -- see docstring
-    # image_dft *= image.numel()  # Scale to variance 1 in real-space
+    image_dft *= image.numel()  # Scale to variance 1 in real-space
 
     return image_dft
 

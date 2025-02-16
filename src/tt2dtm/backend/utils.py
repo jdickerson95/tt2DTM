@@ -14,11 +14,34 @@ def normalize_template_projection(
     small_shape: tuple[int, int],  # (h, w)
     large_shape: tuple[int, int],  # (H, W)
 ) -> torch.Tensor:
-    """Subtract mean of edge values and set variance to 1 (in large shape).
+    r"""Subtract mean of edge values and set variance to 1 (in large shape).
 
     This function uses the fact that variance of a sequence, Var(X), is scaled by the
     relative size of the small (unpadded) and large (padded with zeros) space. Some
     negligible error is introduced into the variance (~1e-4) due to this routine.
+
+    Let $X$ be the large, zero-padded projection and $x$ the small projection each
+    with sizes $(H, W)$ and $(h, w)$, respectively. The mean of the zero-padded
+    projection in terms of the small projection is:
+
+    .. math::
+        \begin{align}
+            \mu(X) &= \frac{1}{H \cdot W} \sum_{i=1}^{H} \sum_{j=1}^{W} X_{ij} \\
+            \mu(X) &= \frac{1}{H \cdot W} \sum_{i=1}^{h} \sum_{j=1}^{w} X_{ij} + 0 \\
+            \mu(X) &= \frac{h \cdot w}{H \cdot W} \mu(x)
+        \end{align}
+    The variance of the zero-padded projection in terms of the small projection can be
+    obtained by:
+    .. math::
+        \begin{align}
+            Var(X) &= \frac{1}{H \cdot W} \sum_{i=1}^{H} \sum_{j=1}^{W} (X_{ij} -
+                \mu(X))^2 \\
+            Var(X) &= \frac{1}{H \cdot W} \left(\sum_{i=1}^{h}
+                \sum_{j=1}^{w} (X_{ij} - \mu(X))^2 +
+                \sum_{i=h+1}^{H}\sum_{i=w+1}^{W} \mu(X)^2 \right) \\
+            Var(X) &= \frac{1}{H \cdot W} \sum_{i=1}^{h} \sum_{j=1}^{w} (X_{ij} -
+                \mu(X))^2 + (H-h)(W-w)\mu(X)^2
+        \end{align}
 
     Parameters
     ----------
@@ -35,15 +58,14 @@ def normalize_template_projection(
         Edge-mean subtracted projections, still in small space, but normalized
         so variance of zero-padded projection is 1.
     """
-    # Constants related to scaling the variance
-    npix_padded = large_shape[0] * large_shape[1] - small_shape[0] * small_shape[1]
-    relative_size = small_shape[0] * small_shape[1] / (large_shape[0] * large_shape[1])
+    h, w = small_shape
+    H, W = large_shape
 
     # Extract edges while preserving batch dimensions
-    top_edge = projections[..., 0, :]  # shape: (..., W)
-    bottom_edge = projections[..., -1, :]  # shape: (..., W)
-    left_edge = projections[..., 1:-1, 0]  # shape: (..., H-2)
-    right_edge = projections[..., 1:-1, -1]  # shape: (..., H-2)
+    top_edge = projections[..., 0, :]  # shape: (..., w)
+    bottom_edge = projections[..., -1, :]  # shape: (..., w)
+    left_edge = projections[..., 1:-1, 0]  # shape: (..., h-2)
+    right_edge = projections[..., 1:-1, -1]  # shape: (..., h-2)
     edge_pixels = torch.concatenate(
         [top_edge, bottom_edge, left_edge, right_edge], dim=-1
     )
@@ -52,17 +74,14 @@ def normalize_template_projection(
     edge_mean = edge_pixels.mean(dim=-1)
     projections -= edge_mean[..., None, None]
 
-    # # Calculate variance like cisTEM (does not match desired results...)
-    # variance = (projections**2).sum(dim=(-1, -2), keepdim=True) * relative_size - (
-    #     projections.mean(dim=(-1, -2), keepdim=True) * relative_size
-    # ) ** 2
-
     # Fast calculation of mean/var using Torch + appropriate scaling.
-    # Scale the variance such that the larger padded space has variance of 1.
-    variance, mean = torch.var_mean(projections, dim=(-1, -2), keepdim=True)
-    mean += relative_size
-    variance *= relative_size
-    variance += (1 / npix_padded) * mean**2
+    relative_size = h * w / (H * W)
+    mean = torch.mean(projections, dim=(-2, -1), keepdim=True) * relative_size
+    mean *= relative_size
+    variance = torch.sum((projections - mean) ** 2, dim=(-2, -1), keepdim=True)
+    variance = (h * w) * variance + (H - h) * (W - w) * (mean**2)
+    # variance /= (H * W) * (H - h) * (W - w)  # NOTE: This would be the correct scaling
+    variance /= (H - h) * (W - w)  # NOTE: But we use this for CCG normalization
 
     return projections / torch.sqrt(variance)
 

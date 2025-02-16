@@ -386,11 +386,6 @@ def _core_match_template_single_gpu(
         # Apply the projective filters on a new batch dimension
         fourier_slice = fourier_slice[None, ...] * projective_filters[:, None, ...]
 
-        # NOTE: This is reshaping into a single batch dimension (not used)
-        # fourier_slice = fourier_slice.reshape(
-        #     -1, fourier_slice.shape[-2], fourier_slice.shape[-1]
-        # )
-
         # Inverse Fourier transform into real space and normalize
         projections = torch.fft.irfftn(fourier_slice, dim=(-2, -1))
         projections = torch.fft.ifftshift(projections, dim=(-2, -1))
@@ -401,7 +396,7 @@ def _core_match_template_single_gpu(
         # Padded forward Fourier transform for cross-correlation
         projections_dft = torch.fft.rfftn(projections, dim=(-2, -1), s=(H, W))
 
-        ### Cross correlation step by element-wise multiplication ###
+        # Cross correlation step by element-wise multiplication
         projections_dft = image_dft[None, None, ...] * projections_dft.conj()
         cross_correlation = torch.fft.irfftn(projections_dft, dim=(-2, -1))
 
