@@ -157,6 +157,13 @@ def do_image_preprocessing(image: torch.Tensor) -> torch.Tensor:
 
     image_dft *= image.numel()  # Scale to variance 1 in real-space
 
+    # NOTE: We add on extra division by sqrt(num_pixels) so the cross-correlograms
+    # are roughly normalized to have mean 0 and variance 1.
+    # We do this here since Fourier transform is linear, and we don't have to multiply
+    # the cross correlation at each iteration. This *will not* make the image
+    # have variance 1.
+    image_dft /= image.numel() ** 0.5
+
     return image_dft
 
 

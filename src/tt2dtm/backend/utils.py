@@ -78,10 +78,13 @@ def normalize_template_projection(
     relative_size = h * w / (H * W)
     mean = torch.mean(projections, dim=(-2, -1), keepdim=True) * relative_size
     mean *= relative_size
+
+    # First term of the variance calculation
     variance = torch.sum((projections - mean) ** 2, dim=(-2, -1), keepdim=True)
-    variance = (h * w) * variance + (H - h) * (W - w) * (mean**2)
-    # variance /= (H * W) * (H - h) * (W - w)  # NOTE: This would be the correct scaling
-    variance /= (H - h) * (W - w)  # NOTE: But we use this for CCG normalization
+
+    # Add the second term of the variance calculation
+    variance += (H - h) * (W - w) * mean**2
+    variance /= H * W
 
     return projections / torch.sqrt(variance)
 

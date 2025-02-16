@@ -173,7 +173,7 @@ def scale_mip(
     )
 
     # Update correlation_sum and correlation_squared_sum to mean and variance
-    correlation_sum = corr_mean
-    correlation_squared_sum = corr_variance
+    correlation_sum.copy_(corr_mean)
+    correlation_squared_sum.copy_(corr_variance)
 
     return mip, mip_scaled
