@@ -8,6 +8,11 @@ import torch
 import tqdm
 from torch_fourier_slice import extract_central_slices_rfft_3d
 
+from tt2dtm.utils.fourier_slice import (
+    extract_central_slices_rfft_3d_bicubic_trilinear, 
+    extract_central_slices_rfft_3d_tricubic_approx,
+)
+
 COMPILE_BACKEND = "inductor"
 DEFAULT_STATISTIC_DTYPE = torch.float32
 
@@ -815,11 +820,34 @@ def _core_match_template_single_gpu(
         )
 
         # Extract central slice(s) from the template volume
-        fourier_slice = extract_central_slices_rfft_3d(
+        # NOTE: This is the old method with linear interpolation
+        #fourier_slice = extract_central_slices_rfft_3d(
+        #    volume_rfft=template_dft,
+        #    image_shape=(h,) * 3,  # NOTE: requires cubic template
+        #    rotation_matrices=rot_matrix,
+        #)
+
+        # NOTE: This is the new method with bicubic trilinear interpolation
+        fourier_slice = extract_central_slices_rfft_3d_bicubic_trilinear(
             volume_rfft=template_dft,
             image_shape=(h,) * 3,  # NOTE: requires cubic template
             rotation_matrices=rot_matrix,
         )
+
+        # NOTE: This is the new method with tricubic approximation
+        #fourier_slice = extract_central_slices_rfft_3d_tricubic_approx(
+        #    volume_rfft=template_dft,
+        #    image_shape=(h,) * 3,  # NOTE: requires cubic template
+        #    rotation_matrices=rot_matrix,
+        #)
+
+        # NOTE: This is the new method with sinc interpolation
+        #fourier_slice = extract_central_slices_rfft_3d_sinc(
+        #    volume_rfft=template_dft,
+        #    image_shape=(h,) * 3,  # NOTE: requires cubic template
+        #    rotation_matrices=rot_matrix,
+        #)
+        
         fourier_slice = torch.fft.ifftshift(fourier_slice, dim=(-2,))
         fourier_slice[..., 0, 0] = 0 + 0j  # zero out the DC component (mean zero)
         # fourier_slice *= -1  # flip contrast

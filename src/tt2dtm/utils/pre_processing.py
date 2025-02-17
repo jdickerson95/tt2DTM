@@ -38,9 +38,9 @@ def calculate_whitening_filter_template(
         output_shape=output_shape,
         output_rfft=True,
         output_fftshift=False,
-        smooth_filter=smoothing,
-        smooth_kernel_size=1001,
-        smooth_sigma=100.0,
+        # smooth_filter=smoothing,
+        # smooth_kernel_size=1001,
+        # smooth_sigma=100.0,
     )
 
 
@@ -161,13 +161,13 @@ def do_image_preprocessing(image: torch.Tensor) -> torch.Tensor:
         fftshift=False,
         dim=(-2, -1),
         do_power_spectrum=True,
-        smooth_filter=False,
-        smooth_kernel_size=1001,
-        smooth_sigma=100.0,
+        # smooth_filter=False,
+        # smooth_kernel_size=1001,
+        # smooth_sigma=100.0,
     )
     bandpass_filter_image = calculate_bandpass_filter(
         low_pass_cutoff=0.00,
-        high_pass_cutoff=0.5,
+        high_pass_cutoff=0.7,
         falloff=0.02,
         image_shape=image.shape[-2:],
         rfft=True,

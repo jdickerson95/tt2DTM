@@ -6,6 +6,7 @@ import numpy as np
 import roma
 import torch
 import tqdm
+import einops
 from ttsim3d.models import Simulator2D, SimulatorConfig
 from ttsim3d.simulate2d import simulate2d
 
@@ -73,7 +74,7 @@ def construct_multi_gpu_match_template_kwargs(
     for device, euler_angles_device in zip(devices, euler_angles_split):
         # Allocate all tensors to the device
         image_dft_device = image_dft.to(device)
-        template_dft_shape_device = template_dft_shape.to(device)
+        template_dft_shape_device = template_dft_shape
         euler_angles_device = euler_angles_device.to(device)
         projective_filters_device = projective_filters.to(device)
         defocus_values_device = defocus_values.to(device)
@@ -803,12 +804,13 @@ def _core_match_template_single_gpu(
         apply_dose_weighting=True,
         dose_start=0.0,  # in e-/A^2
         dose_end=50.0,  # in e-/A^2
+        mtf_reference="mtf_k2_300kV.star",
         upsampling=-1,  # auto
     )
 
     # Instantiate the simulator
     sim = Simulator2D(
-        pdb_filepath="data/parsed_6Q8Y_whole_LSU_match3.pdb",
+        pdb_filepath="parsed_6Q8Y_whole_LSU_match3.pdb",
         pixel_spacing=0.95,  # Angstroms
         image_shape=(h, w),
         b_factor_scaling=0.5,
@@ -816,12 +818,14 @@ def _core_match_template_single_gpu(
         simulator_config=sim_conf,
     )
 
+
+
     atom_b_factors = sim.get_scale_atom_b_factors()
     mtf_frequencies, mtf_amplitudes = sim.simulator_config.mtf_tensors
     ##################################
     ### Start the orientation loop ###
     ##################################
-
+    print(f"Starting orientation loop on device {device.index}")
     for i in orientation_batch_iterator:
         euler_angles_batch = euler_angles[
             i * projection_batch_size : (i + 1) * projection_batch_size
@@ -832,26 +836,31 @@ def _core_match_template_single_gpu(
         )
 
         # Multiply the rot_matrix by the template_atom_positions_zyx
-        template_atom_positions_zyx = sim.atom_positions_zyx * rot_matrix
-        template_atom_positions_yx = template_atom_positions_zyx[:, 1:]
+        template_atom_positions_zyx = einops.rearrange(sim.atom_positions_zyx.to(device), "n d -> 1 n d")
+        template_atom_positions_zyx = torch.matmul(template_atom_positions_zyx, rot_matrix)
+        
+        template_atom_positions_yx = template_atom_positions_zyx[:, :, 1:]
 
-        real_space_template = simulate2d(
-            atom_positions_yx=template_atom_positions_yx,
-            atom_ids=sim.atom_identities,
-            atom_b_factors=atom_b_factors,
-            beam_energy_kev=sim.simulator_config.voltage,
-            sim_pixel_spacing=sim.pixel_spacing,
-            sim_image_shape=(h, w),
-            requested_upsampling=sim.simulator_config.upsampling,
-            apply_dose_weighting=sim.simulator_config.apply_dose_weighting,
-            dose_start=sim.simulator_config.dose_start,
-            dose_end=sim.simulator_config.dose_end,
-            dose_filter_modify_signal=sim.simulator_config.dose_filter_modify_signal,  # type: ignore
-            dose_filter_critical_bfactor=sim.simulator_config.crit_exposure_bfactor,
-            apply_dqe=sim.simulator_config.apply_dqe,
-            mtf_frequencies=mtf_frequencies,
-            mtf_amplitudes=mtf_amplitudes,
-        )
+        real_space_template = torch.zeros((template_atom_positions_yx.shape[0], h, w), device=device)
+        for i in range(template_atom_positions_yx.shape[0]):
+            real_space_template[i] = simulate2d(
+                atom_positions_yx=template_atom_positions_yx[i],
+                atom_ids=sim.atom_identities,
+                atom_b_factors=atom_b_factors,
+                beam_energy_kev=sim.simulator_config.voltage,
+                sim_pixel_spacing=sim.pixel_spacing,
+                sim_image_shape=(h, w),
+                requested_upsampling=sim.simulator_config.upsampling,
+                apply_dose_weighting=sim.simulator_config.apply_dose_weighting,
+                dose_start=sim.simulator_config.dose_start,
+                dose_end=sim.simulator_config.dose_end,
+                dose_filter_modify_signal=sim.simulator_config.dose_filter_modify_signal,  # type: ignore
+                dose_filter_critical_bfactor=sim.simulator_config.crit_exposure_bfactor,
+                apply_dqe=sim.simulator_config.apply_dqe,
+                mtf_frequencies=mtf_frequencies,
+                mtf_amplitudes=mtf_amplitudes,
+                gpu_ids=device_id,
+            )
 
         fourier_slice = torch.fft.rfftn(real_space_template, dim=(-2, -1), s=(h, w))
         fourier_slice[..., 0, 0] = 0 + 0j  # zero out the DC component (mean zero)

@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from pydantic import ConfigDict, field_validator
 from torch_grid_utils import fftfreq_grid
 
+from tt2dtm.backend import core_match_template
 from tt2dtm.backend_project import core_match_template_project
 from tt2dtm.models.computational_config import ComputationalConfig
 from tt2dtm.models.correlation_filters import PreprocessingFilters
@@ -158,7 +159,7 @@ class MatchTemplateManager(BaseModel2DTM):
         )
         bandpass_filter_template = calculate_bandpass_filter(
             low_pass_cutoff=0.00,
-            high_pass_cutoff=0.5,
+            high_pass_cutoff=0.7,
             falloff=0.02,
             image_shape=template_shape,
             rfft=True,
@@ -301,15 +302,14 @@ class MatchTemplateManager(BaseModel2DTM):
         -------
         None
         """
-        # core_kwargs = self.make_backend_core_function_kwargs()
-        # results = core_match_template(
-        #    **core_kwargs, projection_batch_size=projection_batch_size
-        # )
-        core_kwargs = self.make_backend_project_core_function_kwargs()
-
-        results = core_match_template_project(
+        core_kwargs = self.make_backend_core_function_kwargs()
+        results = core_match_template(
             **core_kwargs, projection_batch_size=projection_batch_size
         )
+        #core_kwargs = self.make_backend_project_core_function_kwargs()
+        #results = core_match_template_project(
+        #    **core_kwargs, projection_batch_size=projection_batch_size
+        #)
 
         # Place results into the `MatchTemplateResult` object and save it.
         self.match_template_result.mip = results["mip"]
